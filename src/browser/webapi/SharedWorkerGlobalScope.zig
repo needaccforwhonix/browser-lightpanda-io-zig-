@@ -189,11 +189,11 @@ pub fn close(self: *SharedWorkerGlobalScope) void {
     self._closed = true;
 }
 
-pub fn getOnConnect(self: *const SharedWorkerGlobalScope) ?js.Function.Global {
+fn getOnConnect(self: *const SharedWorkerGlobalScope) ?js.Function.Global {
     return self._on_connect;
 }
 
-pub fn setOnConnect(self: *SharedWorkerGlobalScope, setter: ?WorkerGlobalScope.FunctionSetter) void {
+fn setOnConnect(self: *SharedWorkerGlobalScope, setter: ?WorkerGlobalScope.FunctionSetter) void {
     self._on_connect = WorkerGlobalScope.getFunctionFromSetter(setter);
 }
 
@@ -209,9 +209,7 @@ fn httpHeaderCallback(transfer: *Transfer) !Transfer.HeaderResult {
         return .abort;
     }
 
-    if (transfer.getContentLength()) |cl| {
-        try self._script_buffer.ensureTotalCapacityPrecise(self._script_arena.?.allocator(), cl);
-    }
+    try self._script_buffer.ensureTotalCapacityPrecise(self._script_arena.?.allocator(), transfer.bodyLen());
 
     return .proceed;
 }
@@ -250,10 +248,14 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     self._http_transfer = null;
     self.releaseScriptArena();
 
-    log.err(.browser, "shared worker fetch error", .{
-        .url = self._url,
-        .err = err,
-    });
+    // TransferCanceled is teardown cancelling a still-inflight script fetch,
+    // not a load failure.
+    if (err != error.TransferCanceled) {
+        log.err(.browser, "shared worker fetch error", .{
+            .url = self._url,
+            .err = err,
+        });
+    }
 
     // The worker will never load and onconnect will never be registered.
     // Drain the buffered connects so they get dispatched (and dropped at the

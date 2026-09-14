@@ -23,6 +23,8 @@ const js = @import("../js/js.zig");
 const Factory = @import("../Factory.zig");
 const Scheduler = @import("../js/Scheduler.zig");
 
+const Event = @import("Event.zig");
+const EventTarget = @import("EventTarget.zig");
 const EventCounts = @import("EventCounts.zig");
 const PerformanceObserver = @import("PerformanceObserver.zig");
 
@@ -32,12 +34,17 @@ const Allocator = std.mem.Allocator;
 // https://w3c.github.io/resource-timing/#dfn-resource-timing-buffer-size-limit
 const DEFAULT_RESOURCE_BUFFER_SIZE = 250;
 
+const BUFFER_FULL = "resourcetimingbufferfull";
+
 pub fn registerTypes() []const type {
     return &.{ Performance, Entry, Mark, Measure, ResourceTiming, PerformanceTiming, PerformanceNavigation };
 }
 
 const Performance = @This();
 
+pub const Proto = EventTarget;
+
+_proto: *EventTarget,
 _time_origin: u64,
 _arena: Allocator,
 _factory: *Factory,
@@ -51,11 +58,15 @@ _timing: PerformanceTiming = .{},
 _navigation: PerformanceNavigation = .{},
 _event_counts: EventCounts = .{},
 _resource_buffer_size: u32 = DEFAULT_RESOURCE_BUFFER_SIZE,
+_buffer_full_pending: bool = false,
+_on_buffer_full: ?js.Function.Global = null,
 
-// The owner's task scheduler, set by the owner once its JS context exists
-// (Frame builds the Window, and thus this, before the context). Never taken
-// from a caller's Execution: an isolated-world or cross-frame caller's
-// context can be destroyed while we live on.
+// The owner's task scheduler and its main-world Execution, both set by the
+// owner once its JS context exists (Frame builds the Window, and thus this,
+// before the context) - see attach. Never taken from a caller's Execution: an
+// isolated-world or cross-frame caller's context can be destroyed while we
+// live on.
+_exec: *Execution = undefined,
 _scheduler: *Scheduler = undefined,
 
 // PerformanceObserver infrastructure. Lives here (rather than on the owning
@@ -73,12 +84,22 @@ pub fn highResTimestamp() u64 {
     return rounded;
 }
 
-pub fn init(factory: *Factory, arena: Allocator) Performance {
-    return .{
+pub fn init(factory: *Factory, arena: Allocator) !*Performance {
+    return factory.eventTarget(Performance{
+        ._proto = undefined,
         ._arena = arena,
         ._factory = factory,
         ._time_origin = highResTimestamp(),
-    };
+    });
+}
+
+pub fn attach(self: *Performance, ctx: *js.Context) void {
+    self._exec = &ctx.execution;
+    self._scheduler = &ctx.scheduler;
+}
+
+pub fn asEventTarget(self: *Performance) *EventTarget {
+    return self._proto;
 }
 
 pub fn getTiming(self: *Performance) *PerformanceTiming {
@@ -92,16 +113,16 @@ pub fn now(self: *const Performance) f64 {
     return @as(f64, @floatFromInt(elapsed)) / 1000.0;
 }
 
-pub fn getTimeOrigin(self: *const Performance) f64 {
+fn getTimeOrigin(self: *const Performance) f64 {
     // Return as milliseconds
     return @as(f64, @floatFromInt(self._time_origin)) / 1000.0;
 }
 
-pub fn getNavigation(self: *Performance) *PerformanceNavigation {
+fn getNavigation(self: *Performance) *PerformanceNavigation {
     return &self._navigation;
 }
 
-pub fn getEventCounts(self: *Performance) *EventCounts {
+fn getEventCounts(self: *Performance) *EventCounts {
     return &self._event_counts;
 }
 
@@ -201,7 +222,7 @@ pub fn measure(
     return m;
 }
 
-pub fn clearMarks(self: *Performance, mark_name: ?[]const u8) void {
+fn clearMarks(self: *Performance, mark_name: ?[]const u8) void {
     var i: usize = 0;
     while (i < self._entries.items.len) {
         const entry = self._entries.items[i];
@@ -213,7 +234,7 @@ pub fn clearMarks(self: *Performance, mark_name: ?[]const u8) void {
     }
 }
 
-pub fn clearMeasures(self: *Performance, measure_name: ?[]const u8) void {
+fn clearMeasures(self: *Performance, measure_name: ?[]const u8) void {
     var i: usize = 0;
     while (i < self._entries.items.len) {
         const entry = self._entries.items[i];
@@ -225,16 +246,16 @@ pub fn clearMeasures(self: *Performance, measure_name: ?[]const u8) void {
     }
 }
 
-pub fn setResourceTimingBufferSize(self: *Performance, max_size: u32) void {
+fn setResourceTimingBufferSize(self: *Performance, max_size: u32) void {
     self._resource_buffer_size = max_size;
 }
 
-pub fn clearResourceTimings(self: *Performance) void {
+fn clearResourceTimings(self: *Performance) void {
     self._resources.clearRetainingCapacity();
 }
 
 // All times are microseconds
-pub const ResourceInfo = struct {
+const ResourceInfo = struct {
     name: []const u8,
     initiator: []const u8, // static string
     protocol: []const u8, // static string
@@ -263,11 +284,12 @@ pub const ResourceInfo = struct {
 };
 
 pub fn addResource(self: *Performance, info: ResourceInfo) !void {
-    // TODO: Perfomance should be an EventTarget and it should fire
-    // a resourcetimingbufferfull event
     const buffer_full = self._resources.items.len >= self._resource_buffer_size;
-    if (buffer_full and !self.hasObserverFor(.resource)) {
-        return;
+    if (buffer_full) {
+        try self.scheduleBufferFull();
+        if (self.hasObserverFor(.resource) == false) {
+            return;
+        }
     }
 
     const arena = self._arena;
@@ -571,6 +593,54 @@ fn hasObserverFor(self: *const Performance, kind: Entry.Type.Enum) bool {
     return false;
 }
 
+// https://w3c.github.io/resource-timing/#dfn-fire-a-buffer-full-event
+// The event is queued rather than fired inline: addResource runs from the
+// HTTP layer, with no JS on the stack. We have no secondary buffer, so an
+// entry that overflows is dropped instead of being copied back in by a
+// handler that calls clearResourceTimings.
+fn scheduleBufferFull(self: *Performance) !void {
+    if (self._buffer_full_pending) {
+        return;
+    }
+    if (self._exec.hasDirectListeners(self.asEventTarget(), BUFFER_FULL, self._on_buffer_full) == false) {
+        return;
+    }
+    self._buffer_full_pending = true;
+
+    return self._scheduler.add(
+        self,
+        struct {
+            fn run(_self: *anyopaque) anyerror!?u32 {
+                const perf: *Performance = @ptrCast(@alignCast(_self));
+                perf._buffer_full_pending = false;
+
+                const exec = perf._exec;
+                const event = try Event.initTrusted(.wrap(BUFFER_FULL), .{}, exec.page);
+                try exec.dispatch(perf.asEventTarget(), event, perf._on_buffer_full, .{
+                    .context = "Performance.resourcetimingbufferfull",
+                });
+                return null;
+            }
+        }.run,
+        0,
+        .{ .name = "Performance.bufferFull" },
+    );
+}
+
+// The property handler for a JS-side dispatchEvent (see EventManager.dispatch).
+pub fn inlineHandler(self: *const Performance, typ: lp.String) ?js.Function.Global {
+    if (typ.eql(.wrap(BUFFER_FULL))) return self._on_buffer_full;
+    return null;
+}
+
+fn getOnResourceTimingBufferFull(self: *const Performance) ?js.Function.Global {
+    return self._on_buffer_full;
+}
+
+fn setOnResourceTimingBufferFull(self: *Performance, cb: ?js.Function.Global) void {
+    self._on_buffer_full = cb;
+}
+
 pub fn scheduleDelivery(self: *Performance) !void {
     if (self._delivery_scheduled) {
         return;
@@ -684,6 +754,7 @@ pub const JsApi = struct {
     pub const timing = bridge.accessor(Performance.getTiming, null, .{ .exposed = .window });
     pub const navigation = bridge.accessor(Performance.getNavigation, null, .{ .exposed = .window });
     pub const eventCounts = bridge.accessor(Performance.getEventCounts, null, .{ .exposed = .window });
+    pub const onresourcetimingbufferfull = bridge.accessor(Performance.getOnResourceTimingBufferFull, Performance.setOnResourceTimingBufferFull, .{});
 };
 
 pub const Entry = struct {
@@ -734,11 +805,11 @@ pub const Entry = struct {
         };
     };
 
-    pub fn getDuration(self: *const Entry) f64 {
+    fn getDuration(self: *const Entry) f64 {
         return self._duration;
     }
 
-    pub fn getEntryType(self: *const Entry) []const u8 {
+    fn getEntryType(self: *const Entry) []const u8 {
         return switch (self._type) {
             else => |t| @tagName(t),
         };
@@ -748,7 +819,7 @@ pub const Entry = struct {
         return self._name;
     }
 
-    pub fn getStartTime(self: *const Entry) f64 {
+    fn getStartTime(self: *const Entry) f64 {
         return self._start_time;
     }
 
@@ -782,7 +853,7 @@ pub const Entry = struct {
     };
 };
 
-pub const Mark = struct {
+const Mark = struct {
     pub const Proto = Entry;
 
     _proto: *Entry,
@@ -814,7 +885,7 @@ pub const Mark = struct {
         return m;
     }
 
-    pub fn getDetail(self: *const Mark) ?js.Value.Global {
+    fn getDetail(self: *const Mark) ?js.Value.Global {
         return self._detail;
     }
 
@@ -830,7 +901,7 @@ pub const Mark = struct {
     };
 };
 
-pub const Measure = struct {
+const Measure = struct {
     pub const Proto = Entry;
 
     _proto: *Entry,
@@ -878,7 +949,7 @@ pub const Measure = struct {
         return m;
     }
 
-    pub fn getDetail(self: *const Measure) ?js.Value.Global {
+    fn getDetail(self: *const Measure) ?js.Value.Global {
         return self._detail;
     }
 
@@ -896,7 +967,7 @@ pub const Measure = struct {
 
 /// PerformanceResourceTiming — one per fetch the HTTP client completed for
 /// this document (or worker).
-pub const ResourceTiming = struct {
+const ResourceTiming = struct {
     pub const Proto = Entry;
 
     _proto: *Entry,
@@ -921,97 +992,97 @@ pub const ResourceTiming = struct {
     _content_type: []const u8,
     _content_encoding: []const u8,
 
-    pub fn getInitiatorType(self: *const ResourceTiming) []const u8 {
+    fn getInitiatorType(self: *const ResourceTiming) []const u8 {
         return self._initiator_type;
     }
 
-    pub fn getNextHopProtocol(self: *const ResourceTiming) []const u8 {
+    fn getNextHopProtocol(self: *const ResourceTiming) []const u8 {
         return self._next_hop_protocol;
     }
 
-    pub fn getDeliveryType(self: *const ResourceTiming) []const u8 {
+    fn getDeliveryType(self: *const ResourceTiming) []const u8 {
         return self._delivery_type;
     }
 
-    pub fn getWorkerStart(_: *const ResourceTiming) f64 {
+    fn getWorkerStart(_: *const ResourceTiming) f64 {
         // @ServiceWorker
         return 0;
     }
 
-    pub fn getRedirectStart(self: *const ResourceTiming) f64 {
+    fn getRedirectStart(self: *const ResourceTiming) f64 {
         return self._redirect_start;
     }
 
-    pub fn getRedirectEnd(self: *const ResourceTiming) f64 {
+    fn getRedirectEnd(self: *const ResourceTiming) f64 {
         return self._redirect_end;
     }
 
-    pub fn getFetchStart(self: *const ResourceTiming) f64 {
+    fn getFetchStart(self: *const ResourceTiming) f64 {
         return self._fetch_start;
     }
 
-    pub fn getDomainLookupStart(self: *const ResourceTiming) f64 {
+    fn getDomainLookupStart(self: *const ResourceTiming) f64 {
         return self._domain_lookup_start;
     }
 
-    pub fn getDomainLookupEnd(self: *const ResourceTiming) f64 {
+    fn getDomainLookupEnd(self: *const ResourceTiming) f64 {
         return self._domain_lookup_end;
     }
 
-    pub fn getConnectStart(self: *const ResourceTiming) f64 {
+    fn getConnectStart(self: *const ResourceTiming) f64 {
         return self._connect_start;
     }
 
-    pub fn getConnectEnd(self: *const ResourceTiming) f64 {
+    fn getConnectEnd(self: *const ResourceTiming) f64 {
         return self._connect_end;
     }
 
-    pub fn getSecureConnectionStart(self: *const ResourceTiming) f64 {
+    fn getSecureConnectionStart(self: *const ResourceTiming) f64 {
         return self._secure_connection_start;
     }
 
-    pub fn getRequestStart(self: *const ResourceTiming) f64 {
+    fn getRequestStart(self: *const ResourceTiming) f64 {
         return self._request_start;
     }
 
-    pub fn getResponseStart(self: *const ResourceTiming) f64 {
+    fn getResponseStart(self: *const ResourceTiming) f64 {
         return self._response_start;
     }
 
-    pub fn getResponseEnd(self: *const ResourceTiming) f64 {
+    fn getResponseEnd(self: *const ResourceTiming) f64 {
         return self._response_end;
     }
 
-    pub fn getFirstInterimResponseStart(_: *const ResourceTiming) f64 {
+    fn getFirstInterimResponseStart(_: *const ResourceTiming) f64 {
         // 1xx are consumed by libcurl
         return 0;
     }
 
-    pub fn getFinalResponseHeadersStart(self: *const ResourceTiming) f64 {
+    fn getFinalResponseHeadersStart(self: *const ResourceTiming) f64 {
         return self._response_start;
     }
 
-    pub fn getTransferSize(self: *const ResourceTiming) u64 {
+    fn getTransferSize(self: *const ResourceTiming) u64 {
         return self._transfer_size;
     }
 
-    pub fn getEncodedBodySize(self: *const ResourceTiming) u64 {
+    fn getEncodedBodySize(self: *const ResourceTiming) u64 {
         return self._encoded_body_size;
     }
 
-    pub fn getDecodedBodySize(self: *const ResourceTiming) u64 {
+    fn getDecodedBodySize(self: *const ResourceTiming) u64 {
         return self._decoded_body_size;
     }
 
-    pub fn getResponseStatus(self: *const ResourceTiming) u16 {
+    fn getResponseStatus(self: *const ResourceTiming) u16 {
         return self._response_status;
     }
 
-    pub fn getContentType(self: *const ResourceTiming) []const u8 {
+    fn getContentType(self: *const ResourceTiming) []const u8 {
         return self._content_type;
     }
 
-    pub fn getContentEncoding(self: *const ResourceTiming) []const u8 {
+    fn getContentEncoding(self: *const ResourceTiming) []const u8 {
         return self._content_encoding;
     }
 
@@ -1184,6 +1255,7 @@ test "WebApi: Performance" {
 test "WebApi: Performance.resource_timing" {
     try testing.htmlRunner("performance_resource_timing.html", .{});
     try testing.htmlRunner("performance_resource_timing_buffer.html", .{});
+    try testing.htmlRunner("performance_resource_timing_buffer_full.html", .{});
 }
 
 test "Performance: minimizeMimeType" {

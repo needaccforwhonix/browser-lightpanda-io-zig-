@@ -109,6 +109,10 @@ tearing_down: bool = false,
 
 heap_limit_protected: bool = false,
 
+// Message for the next TypeError the bridge builds. Set by local.typeError.
+// Think of it as our own little global errno. How cute.
+error_message: ?[]const u8 = null,
+
 pub const InitOpts = struct {
     with_inspector: bool = false,
 };
@@ -237,13 +241,17 @@ pub fn deinit(self: *Env) void {
     allocator.free(self.eternal_function_templates);
     self.private_symbols.deinit();
 
+    // This has to be before it's destroyed, since the handle has to exist to
+    // be able to notify the platform about it. Documentation hits at this order:
+    // "Notifies the given platform about the Isolate getting deleted soon"
+    v8.v8__Platform__NotifyIsolateShutdown(self.platform.handle, self.isolate.handle);
     self.isolate.exit();
     self.isolate.deinit();
     v8.v8__ArrayBuffer__Allocator__DELETE(self.isolate_params.array_buffer_allocator.?);
     allocator.destroy(self.isolate_params);
 }
 
-pub const ContextParams = struct {
+const ContextParams = struct {
     identity: *js.Identity,
     identity_arena: Allocator,
     call_arena: Allocator,
@@ -546,27 +554,6 @@ pub fn memoryPressureNotification(self: *Env, level: Isolate.MemoryPressureLevel
     self.isolate.memoryPressureNotification(level);
 }
 
-pub fn dumpMemoryStats(self: *Env) void {
-    const stats = self.isolate.getHeapStatistics();
-    std.debug.print(
-        \\ Total Heap Size: {d}
-        \\ Total Heap Size Executable: {d}
-        \\ Total Physical Size: {d}
-        \\ Total Available Size: {d}
-        \\ Used Heap Size: {d}
-        \\ Heap Size Limit: {d}
-        \\ Malloced Memory: {d}
-        \\ External Memory: {d}
-        \\ Peak Malloced Memory: {d}
-        \\ Number Of Native Contexts: {d}
-        \\ Number Of Detached Contexts: {d}
-        \\ Total Global Handles Size: {d}
-        \\ Used Global Handles Size: {d}
-        \\ Zap Garbage: {any}
-        \\
-    , .{ stats.total_heap_size, stats.total_heap_size_executable, stats.total_physical_size, stats.total_available_size, stats.used_heap_size, stats.heap_size_limit, stats.malloced_memory, stats.external_memory, stats.peak_malloced_memory, stats.number_of_native_contexts, stats.number_of_detached_contexts, stats.total_global_handles_size, stats.used_global_handles_size, stats.does_zap_garbage });
-}
-
 // The single "must not run JS" predicate. We're the only ones who ever call
 // TerminateExecution (here and in terminateInterrupt) and both set this flag,
 // so it's always at least as true as v8__Isolate__IsExecutionTerminating —
@@ -583,15 +570,11 @@ pub fn terminate(self: *Env) void {
     v8.v8__Isolate__TerminateExecution(self.isolate.handle);
 }
 
-// We need a stable pointer for *Env, so can't be setup in init.
+/// We need a stable pointer for `*Env`, so can't be setup in `init`.
 pub fn protectHeapLimit(self: *Env) void {
     self.heap_limit_protected = true;
     v8.v8__Isolate__AddNearHeapLimitCallback(self.isolate.handle, nearHeapLimit, self);
-    // TODO: uncomment this when https://github.com/lightpanda-io/zig-v8-fork/pull/187 lands
-    // if our nearHeapLimit extends the memory, we want to  restore the original
-    // value, since the isolate can be long lived (relative to the page/script
-    // that caused the memory spike).
-    // v8.v8__Isolate__AutomaticallyRestoreInitialHeapLimit(self.isolate.handle, 0.5);
+    v8.v8__Isolate__AutomaticallyRestoreInitialHeapLimit(self.isolate.handle, 0.5);
 }
 
 // v8 is telling us it's about to run out of memory for this isolate. We'll

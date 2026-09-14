@@ -37,6 +37,7 @@ const URL = @import("URL.zig");
 const referrer = @import("referrer.zig");
 const Blob = @import("webapi/Blob.zig");
 const FileList = @import("webapi/FileList.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const EventTarget = @import("webapi/EventTarget.zig");
@@ -75,6 +76,7 @@ const AnimatedPreserveAspectRatio = @import("webapi/svg/AnimatedPreserveAspectRa
 
 const sys_url = @import("../sys/url.zig");
 const HttpClient = @import("../network/HttpClient.zig");
+const GlobalScope = @import("global_scope.zig").GlobalScope;
 
 const GlobalEventHandlersLookup = @import("webapi/global_event_handlers.zig").Lookup;
 
@@ -190,6 +192,10 @@ _event_target_attr_listeners: GlobalEventHandlersLookup = .empty,
 // File objects (reference counted via their Blob proto); released at teardown.
 _file_lists: std.ArrayList(*FileList) = .empty,
 
+// Every matchMedia() result of this document, so a viewport change can fire
+// their `change`.
+_media_query_lists: std.ArrayList(*MediaQueryList) = .empty,
+
 /// Element `load`/`error` events queued to fire on the next scheduler tick,
 /// and flushed before window's `load` event.
 /// A call to `documentIsComplete` (which calls `_documentIsComplete`) resets it.
@@ -240,11 +246,19 @@ _upgrading_element: ?*Node = null,
 // during upgrade is a TypeError.
 _upgrading_consumed: bool = false,
 
-// Set when materializing the fragment parser's context element. The element
-// is never inserted into the tree so if its a custom element ,we must not run
-// its constructor (else we'll end up in an endless loop if the constructor
-// sets this.innerHTML = '...', which happens).
-_skip_custom_element_upgrade: bool = false,
+// How node_factory creates an element with a hyphenated HTML tag name.
+_custom_element_creation: enum {
+    // Look the definition up in this frame's registry and run the
+    // constructor synchronously.
+    construct,
+    // Fragment-parse context element. Not inserted into the tree, so its
+    // constructor must not run (you end up in an endless loop if the constructor
+    // does this.innerHTML = '...', which happens).
+    bare_context,
+    // The target document has no custom element registry (e.g. DOMParser). The
+    // element stays undefined until it's inserted into the frame's document.
+    undefined,
+} = .construct,
 
 // List of custom elements that were created before their definition was registered
 _undefined_custom_elements: std.ArrayList(*Element.Html.Custom) = .empty,
@@ -350,7 +364,7 @@ _http_headers: std.ArrayList(HttpHeader) = .empty,
 _referrer: ?[]const u8 = null,
 referrer_policy: referrer.Policy = .default,
 
-pub const HttpHeader = struct {
+const HttpHeader = struct {
     name: []const u8,
     value: []const u8,
 };
@@ -431,7 +445,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         ._proto = undefined,
         ._document = self.document,
         ._location = undefined,
-        ._performance = .init(factory, arena),
+        ._performance = try .init(factory, arena),
         ._screen = screen,
         ._visual_viewport = visual_viewport,
         ._cross_origin_wrapper = undefined,
@@ -447,18 +461,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
     }
     self.window._cross_origin_wrapper = .{ .window = self.window };
 
-    self._http_owner = .{
-        .blob_urls = &page.blob_urls,
-        .origin = &self.origin,
-        .url = &self.url,
-        .parent = if (parent) |p| &p._http_owner else null,
-        .frame_id = frame_id,
-        .document_frame_id = frame_id,
-        .loader_id = self._loader_id,
-        .cookie_jar = &session.cookie_jar,
-        .notification = session.notification,
-        .performance = &self.window._performance,
-    };
+    self._http_owner = GlobalScope.initHttpOwner(.{ .frame = self });
 
     self._style_manager = try StyleManager.init(self);
     errdefer self._style_manager.deinit();
@@ -474,7 +477,7 @@ pub fn init(self: *Frame, frame_id: u32, page: *Page, opts: InitOpts) !void {
         .local_arena = self.local_arena,
     });
     errdefer browser.env.destroyContext(self.js);
-    self.window._performance._scheduler = &self.js.scheduler;
+    self.window._performance.attach(self.js);
 
     const location = try Location.init("about:blank", self);
     // We're holding a reference in Zig-side.
@@ -594,6 +597,17 @@ pub fn deinit(self: *Frame) void {
 
     self._call_arena.release();
     self._local_arena.release();
+}
+
+pub fn viewportChanged(self: *Frame) void {
+    var i: usize = 0;
+    while (i < self._media_query_lists.items.len) : (i += 1) {
+        self._media_query_lists.items[i].viewportChanged();
+    }
+    i = 0;
+    while (i < self.child_frames.items.len) : (i += 1) {
+        self.child_frames.items[i].viewportChanged();
+    }
 }
 
 pub fn trackWorker(self: *Frame, worker: *Worker) !void {
@@ -1028,6 +1042,9 @@ fn scheduleNavigationWithArena(originator: *Frame, arena: *lp.Arena, request_url
             try session.navigation.updateEntries(target.url, opts.kind, target, true);
         }
 
+        // `:target` matches off the fragment, which just changed.
+        target.styleChanged();
+
         try target.queueHashChange(old_url, target.url);
 
         // don't defer this, the caller is responsible for freeing it on error
@@ -1187,7 +1204,7 @@ pub fn documentIsLoaded(self: *Frame) void {
     };
 }
 
-pub fn _documentIsLoaded(self: *Frame) !void {
+fn _documentIsLoaded(self: *Frame) !void {
     try self.dispatchReadyStateChange();
 
     const event = try Event.initTrusted(.wrap("DOMContentLoaded"), .{ .bubbles = true }, self._page);
@@ -1220,7 +1237,7 @@ pub fn scriptsCompletedLoading(self: *Frame) void {
     self.pendingLoadCompleted();
 }
 
-pub fn iframeCompletedLoading(self: *Frame, iframe: *IFrame, delays_load: bool) void {
+fn iframeCompletedLoading(self: *Frame, iframe: *IFrame, delays_load: bool) void {
     // When parsing HTML, fire any load event for an iframe on the next tick.
     const parsing_html = switch (self._parse_state) {
         .html => true,
@@ -1619,7 +1636,9 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
         // to sniff the content type
         var mime: Mime = blk: {
             if (transfer.contentType()) |ct| {
-                break :blk try Mime.parse(ct);
+                // A Content-Type we can't parse must not fail the navigation;
+                // browsers render the page anyway, so fall back to sniffing.
+                break :blk Mime.parseLenient(ct) catch Mime.sniff(data);
             }
             break :blk Mime.sniff(data);
         } orelse .unknown;
@@ -1922,10 +1941,11 @@ pub fn scriptAddedCallback(self: *Frame, comptime from_parser: bool, script: *El
     }
 
     self._script_manager.addFromElement(from_parser, script, "parsing") catch |err| {
-        log.err(.frame, "frame.scriptAddedCallback", .{
+        const level: log.Level = if (err == error.UrlBlocked) .warn else .err;
+        log.log(.frame, level, "frame.scriptAddedCallback", .{
             .err = err,
             .url = self.url,
-            .src = script.asElement().getAttributeSafe(comptime .wrap("src")),
+            .src = script.asElement().getAttributeInterned("src"),
             .type = self._type,
         });
     };
@@ -1951,7 +1971,7 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
             break :blk "about:srcdoc";
         }
 
-        var src = iframe.asElement().getAttributeSafe(comptime .wrap("src")) orelse "";
+        var src = iframe.asElement().getAttributeInterned("src") orelse "";
         if (src.len == 0) {
             src = "about:blank";
         }
@@ -2150,11 +2170,18 @@ pub fn openPopup(self: *Frame, opts: OpenPopupOpts) !*Frame {
 
 pub fn domChanged(self: *Frame) void {
     self._page.dom_version += 1;
+    self.styleChanged();
 
     // A DOM change is our "rendering opportunity": re-evaluate the layout
     // observers. Both are no-ops unless something they track actually changed.
     observers.scheduleIntersectionChecks(self);
     observers.scheduleResizeChecks(self);
+}
+
+/// Stamps the cascade: any change that can alter a selector match or cascade
+/// result, including non-tree state that live collections never see.
+pub fn styleChanged(self: *Frame) void {
+    self._page.style_version += 1;
 }
 
 const ElementIdMaps = struct { lookup: *std.StringHashMapUnmanaged(*Element), removed_ids: *std.StringHashMapUnmanaged(void) };
@@ -2251,7 +2278,7 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
     // exists, so scan it.
     var tw = TreeWalker.Full.Elements.init(node, .{});
     while (tw.next()) |el| {
-        const element_id = el.getAttributeSafe(comptime .wrap("id")) orelse continue;
+        const element_id = el.getId() orelse continue;
         if (std.mem.eql(u8, element_id, id)) {
             return el;
         }
@@ -2260,7 +2287,7 @@ pub fn getElementByIdFromNode(self: *Frame, node: *Node, id: []const u8) ?*Eleme
 }
 
 pub fn performance(self: *Frame) *Performance {
-    return &self.window._performance;
+    return self.window._performance;
 }
 
 // Tracks a file input's FileList so its File refs are released at teardown.
@@ -2665,6 +2692,8 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 
     child._parent = null;
 
+    Element.Html.Select.childRemoved(parent, child);
+
     // Update live ranges for removal (DOM spec remove steps 4-7)
     if (child_index_for_ranges) |idx| {
         self.updateRangesForNodeRemoval(parent, child, idx);
@@ -2712,7 +2741,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
     // so ask it directly whether it's still in the document.
     if (self.document._active_element) |active| {
         if (active.asNode().isConnected() == false) {
-            self.document._active_element = null;
+            self.document.setActiveElement(null, self);
         }
     }
 
@@ -2721,7 +2750,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
     // the ID map and invoking disconnectedCallback for custom elements
     var tw = TreeWalker.Full.Elements.init(child, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             self.removeElementIdWithMaps(old_id_maps.?, id);
         }
 
@@ -2764,7 +2793,7 @@ pub fn removeNode(self: *Frame, parent: *Node, child: *Node, opts: RemoveNodeOpt
 fn unregisterSubtreeIds(self: *Frame, node: *Node, id_maps: ElementIdMaps) void {
     var tw = TreeWalker.Full.Elements.init(node, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             self.removeElementIdWithMaps(id_maps, id);
         }
     }
@@ -2782,7 +2811,7 @@ pub fn insertAllChildrenBefore(self: *Frame, fragment: *Node, parent: *Node, ref
     return self.moveAllChildren(fragment, parent, ref_node, .records);
 }
 
-pub const MoveChildrenNotify = enum { records, silent_parent };
+const MoveChildrenNotify = enum { records, silent_parent };
 
 // Moves every child of `source` into `parent` (before `ref_node`, or
 // appended). Per the DOM insert algorithm for fragments, observers get one
@@ -2874,7 +2903,7 @@ const InsertNodeOpts = struct {
 pub fn insertNodeRelative(self: *Frame, parent: *Node, child: *Node, relative: InsertNodeRelative, opts: InsertNodeOpts) !void {
     return self._insertNodeRelative(false, parent, child, relative, opts);
 }
-pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, child: *Node, relative: InsertNodeRelative, opts: InsertNodeOpts) !void {
+fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *Node, child: *Node, relative: InsertNodeRelative, opts: InsertNodeOpts) !void {
     // caller should have made sure this was the case
 
     lp.assert(child._parent == null, "Frame.insertNodeRelative parent", .{});
@@ -2893,6 +2922,8 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
         },
     }
     child._parent = parent;
+
+    Element.Html.Select.childInserted(parent, child);
 
     // Update live ranges for insertion (DOM spec insert step 6).
     // For .before/.after the child was inserted at a specific position;
@@ -2922,6 +2953,9 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
     // The parser path does its own (limited) notification and
     // connected-callback work, then returns.
     if (comptime from_parser) {
+        // Not domChanged: live collections keep their cursors mid-parse.
+        self.styleChanged();
+
         // Main-document parser insertions notify per node: scripts running
         // during parsing can observe the document. Fragment parses
         // (innerHTML et al.) stay silent; Node.setHTML queues one combined
@@ -2935,7 +2969,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
             // For main document parsing we know nodes are connected (fast path);
             // for fragment parsing (innerHTML) we check connectivity.
             if (child.isConnected() or child.isInShadowTree()) {
-                if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+                if (el.getId()) |id| {
                     try self.addElementId(parent, el, id);
                 }
                 try Element.Html.Custom.enqueueConnectedCallbackOnElement(true, el, self);
@@ -2989,7 +3023,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
                 // id to the new parent...
                 var tw = TreeWalker.Full.Elements.init(child, .{});
                 while (tw.next()) |el| {
-                    if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+                    if (el.getId()) |id| {
                         try self.addElementIdWithMaps(new_id_maps, el, id);
                     }
                 }
@@ -3009,7 +3043,7 @@ pub fn _insertNodeRelative(self: *Frame, comptime from_parser: bool, parent: *No
 
     var tw = TreeWalker.Full.Elements.init(child, .{});
     while (tw.next()) |el| {
-        if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+        if (el.getId()) |id| {
             try self.addElementIdWithMaps(new_id_maps, el, id);
         }
 
@@ -3082,7 +3116,7 @@ pub fn attributeRemove(self: *Frame, element: *Element, name: String, old_value:
 }
 
 fn styleAttributeChanged(self: *Frame, element: *Element, value: ?[]const u8) void {
-    const style = element.getStyle(self) orelse return;
+    const style = element.existingStyle(self) orelse return;
     style.asCSSStyleDeclaration().styleAttributeChanged(value, self) catch |err| {
         log.err(.frame, "style attribute reparse", .{ .err = err, .type = self._type, .url = self.url });
     };
@@ -3140,7 +3174,7 @@ pub fn updateRangesForSplitText(self: *Frame, target: *Node, new_node: *Node, of
 /// Update all live ranges after a node insertion.
 /// Per DOM spec insert algorithm step 6: only applies when inserting before a
 /// non-null reference node.
-pub fn updateRangesForNodeInsertion(self: *Frame, parent: *Node, child_index: u32) void {
+fn updateRangesForNodeInsertion(self: *Frame, parent: *Node, child_index: u32) void {
     var it: ?*std.DoublyLinkedList.Node = self._live_ranges.first;
     while (it) |link| : (it = link.next) {
         const ar: *AbstractRange = @fieldParentPtr("_range_link", link);
@@ -3150,7 +3184,7 @@ pub fn updateRangesForNodeInsertion(self: *Frame, parent: *Node, child_index: u3
 
 /// Update all live ranges after a node removal.
 /// Per DOM spec remove algorithm steps 4-7.
-pub fn updateRangesForNodeRemoval(self: *Frame, parent: *Node, child: *Node, child_index: u32) void {
+fn updateRangesForNodeRemoval(self: *Frame, parent: *Node, child: *Node, child_index: u32) void {
     var it: ?*std.DoublyLinkedList.Node = self._live_ranges.first;
     while (it) |link| : (it = link.next) {
         const ar: *AbstractRange = @fieldParentPtr("_range_link", link);
@@ -3377,7 +3411,7 @@ const IdleNotification = union(enum) {
     }
 };
 
-pub const NavigateReason = enum {
+const NavigateReason = enum {
     anchor,
     address_bar,
     form,
@@ -3446,7 +3480,7 @@ pub const QueuedNavigation = struct {
     navigation_type: NavigationType,
 };
 
-pub const TargetFrame = union(enum) {
+const TargetFrame = union(enum) {
     frame: *Frame,
     blank,
 };
@@ -3507,7 +3541,7 @@ pub fn openBlankTarget(self: *Frame, element: *Element, url: []const u8) !*Frame
 }
 
 fn hasRelToken(element: *Element, token: []const u8) bool {
-    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return false;
+    const rel = element.getAttributeInterned("rel") orelse return false;
     var it = std.mem.tokenizeAny(u8, rel, &std.ascii.whitespace);
     while (it.next()) |t| {
         if (std.ascii.eqlIgnoreCase(t, token)) {
@@ -3521,7 +3555,7 @@ fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
     for (frame.child_frames.items) |f| {
         if (f.iframe) |iframe| {
             if (iframe.asNode().isConnected()) {
-                const frame_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse "";
+                const frame_name = iframe.asElement().getName() orelse "";
                 if (std.mem.eql(u8, frame_name, name)) {
                     return f;
                 }
@@ -3552,7 +3586,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     }
 
     if (submitter_) |submitter| {
-        if (submitter.getAttributeSafe(comptime .wrap("disabled")) != null) {
+        if (submitter.getAttributeInterned("disabled") != null) {
             return;
         }
     }
@@ -3574,7 +3608,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
                 break :blk ft;
             }
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("target"));
+        break :blk form_element.getAttributeInterned("target");
     };
 
     const target: TargetFrame = blk: {
@@ -3665,7 +3699,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         if (submit_button) |s| {
             if (s.getAttributeSafe(comptime .wrap("formmethod"))) |fm| break :blk fm;
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("method"));
+        break :blk form_element.getAttributeInterned("method");
     };
     const method = Element.Html.Form.normalizeMethod(method_attr, "get");
 
@@ -3721,7 +3755,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         if (submit_button) |s| {
             if (s.getAttributeSafe(comptime .wrap("formaction"))) |fa| break :blk fa;
         }
-        break :blk form_element.getAttributeSafe(comptime .wrap("action")) orelse self.url;
+        break :blk form_element.getAttributeInterned("action") orelse self.url;
     };
 
     var opts = NavigateOpts{

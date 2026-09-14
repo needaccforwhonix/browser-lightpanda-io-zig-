@@ -30,6 +30,7 @@ const referrer = @import("../browser/referrer.zig");
 const WebSocket = @import("../browser/webapi/net/WebSocket.zig");
 const Cookie = @import("../browser/webapi/storage/Cookie.zig");
 const Performance = @import("../browser/webapi/Performance.zig");
+const GlobalScope = @import("../browser/global_scope.zig").GlobalScope;
 
 const http = @import("http.zig");
 const Network = @import("Network.zig");
@@ -46,7 +47,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Method = http.Method;
 pub const Header = http.Header;
-pub const HeaderIterator = http.HeaderIterator;
+const HeaderIterator = http.HeaderIterator;
 
 // This is loosely tied to a browser Frame. Loading all the <scripts>, doing
 // XHR requests, and loading imports all happens through here. Sine the app
@@ -152,6 +153,10 @@ test_fail_submit: if (lp.IS_TEST) ?anyerror else void = if (lp.IS_TEST) null els
 // When set, takes precedence over the config's http_headers value.
 // Allocated from self.allocator when set, null otherwise.
 user_agent_override: ?[:0]const u8 = null,
+
+// Accept-Language override set via CDP Emulation.setUserAgentOverride.
+// Drives both the request header and navigator.languages.
+accept_language_override: ?lp.Config.HttpHeaders.AcceptLanguage = null,
 
 // The driver (CDP / BiDi) attached to us. If there's a driver, then there's
 // an inbox for us to process (and there's someone to wake us up from a poll)
@@ -263,6 +268,7 @@ pub fn deinit(self: *Client) void {
     self.handles.deinit();
 
     self.clearUserAgentOverride();
+    self.clearAcceptLanguageOverride();
     if (self.http_proxy_owned) |owned| {
         self.allocator.free(owned);
     }
@@ -300,6 +306,19 @@ pub fn clearUserAgentOverride(self: *Client) void {
     if (self.user_agent_override) |ua| {
         self.allocator.free(ua);
         self.user_agent_override = null;
+    }
+}
+
+// Set an Accept-Language override, allocated from self.allocator.
+pub fn setAcceptLanguageOverride(self: *Client, value: []const u8) !void {
+    self.clearAcceptLanguageOverride();
+    self.accept_language_override = try .init(self.allocator, value);
+}
+
+pub fn clearAcceptLanguageOverride(self: *Client) void {
+    if (self.accept_language_override) |override| {
+        override.deinit(self.allocator);
+        self.accept_language_override = null;
     }
 }
 
@@ -398,23 +417,21 @@ fn clearUrlBlocklist(self: *Client) void {
 /// Every reason a request is refused before it reaches the network:
 /// `--block-urls` patterns and the `--adblock-lists` filters both land here
 /// so that no call site can apply one without the other.
-fn isUrlBlocked(self: *const Client, url: [:0]const u8, internal: bool) bool {
-    if (internal) return false;
+fn isUrlBlocked(self: *const Client, transfer: *const Transfer) bool {
+    const req = &transfer.req;
+    if (req.internal) return false;
     if (self.url_blocklist) |*blocklist| {
-        if (blocklist.isBlocked(url)) return true;
+        if (blocklist.isBlocked(req.url)) return true;
     }
-    return self.isHostAdblocked(url);
+    return if (self.network.adblocker) |*blocker| blocker.isBlocked(transfer) else false;
 }
 
-fn isHostAdblocked(self: *const Client, url: [:0]const u8) bool {
-    const blocker = if (self.network.adblocker) |*b| b else return false;
-    const host = URL.getHostname(url);
-    if (host.len == 0 or host.len > 253) return false;
-    // The trie expects normalized (lowercase) hostnames; URLs aren't
-    // guaranteed to arrive that way.
-    var buf: [253]u8 = undefined;
-    const hostname = std.ascii.lowerString(&buf, host);
-    return blocker.matchHostname(hostname) == .blocked;
+fn adblockSourceUrl(transfer: *const Transfer) ?[]const u8 {
+    var owner: *const Owner = transfer.owner orelse return null;
+    if (transfer.req.resource_type == .document) {
+        owner = owner.parent orelse return null;
+    }
+    return owner.documentUrl();
 }
 
 fn isCrossOriginModeAllowed(transfer: *const Transfer) bool {
@@ -430,6 +447,14 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
     return self.user_agent_override orelse self.network.config.http_headers.user_agent;
 }
 
+pub fn getAcceptLanguage(self: *const Client) [:0]const u8 {
+    return (self.accept_language_override orelse self.network.config.http_headers.accept_language).header;
+}
+
+pub fn getLanguages(self: *const Client) []const []const u8 {
+    return (self.accept_language_override orelse self.network.config.http_headers.accept_language).languages;
+}
+
 // Headers _all_ requests include.
 pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
     return .{
@@ -438,7 +463,7 @@ pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
         .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
-        .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
+        .{ .name = "Accept-Language", .value = self.getAcceptLanguage() },
     };
 }
 
@@ -546,7 +571,7 @@ pub fn cancelRequests(self: *Client, owner: *Owner) void {
 }
 
 // Point-in-time snapshot of the client's outstanding work
-pub const Activity = struct {
+const Activity = struct {
     // in-flight + buffered-awaiting-dispatch + parked-for-CDP-interception
     http: usize,
 
@@ -632,8 +657,8 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             if (owned.frame_id == 0) owned.frame_id = o.frame_id;
             if (owned.loader_id == 0) owned.loader_id = o.loader_id;
             if (owned.document_frame_id == null) owned.document_frame_id = o.document_frame_id;
-            if (owned.notification == null) owned.notification = o.notification;
-            cookie_jar = o.cookie_jar;
+            if (owned.notification == null) owned.notification = o.scope.notification();
+            cookie_jar = o.scope.cookieJar();
         }
         // Resolved onto the transfer; the request's copy is left null so
         // nothing reads the caller's (possibly short-lived) url through it.
@@ -647,7 +672,7 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             owned.basic_auth_credentials = try arena.dupeZ(u8, c);
         }
 
-        const raw_origin: ?[]const u8 = req.origin orelse if (owner) |o| o.origin.* else null;
+        const raw_origin: ?[]const u8 = req.origin orelse if (owner) |o| o.scope.origin() else null;
         owned.origin = if (raw_origin) |origin| try arena.dupe(u8, origin) else null;
 
         // The body can be larger, so callers can signal, via the
@@ -1027,9 +1052,13 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
             continue :sw SubmitFrom.after_intercept;
         },
         .after_intercept => {
-            if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
+            if (self.isUrlBlocked(transfer)) {
                 log.info(.http, "blocked url", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UrlBlocked);
+            }
+
+            if (transfer.req.internal == false) {
+                try setOriginHeader(transfer);
             }
 
             if (self.obey_cors and !transfer.req.internal) {
@@ -1087,6 +1116,40 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
         },
         .network => try self.processTransfer(transfer),
     }
+}
+
+// A cors request always carries an Origin. Everything else only carries one
+// for an unsafe method - same origin or not. Can't go in CorsGate since it can
+// be disabled.
+fn setOriginHeader(transfer: *Transfer) !void {
+    const req = &transfer.req;
+
+    const cross_origin = transfer._cors_origin_tainted or blk: {
+        const origin = req.origin orelse break :blk true;
+        break :blk URL.isSameOrigin(req.url, origin) == false;
+    };
+
+    const cors_tainted = cross_origin and switch (req.request_mode) {
+        .cors, .same_origin => true,
+        // A navigation is never cors-tainted. Chrome only sends an Origin on
+        // an unsafe one (a form POST), which the method check below covers.
+        .no_cors, .navigate => false,
+    };
+
+    const unsafe_method = req.method != .GET and req.method != .HEAD;
+    if (cors_tainted == false and unsafe_method == false) {
+        // A 301/302/303 rewrites the method to GET, leaving the previous hop's
+        // Origin behind. Only drop one we put there ourselves.
+        for (transfer.req_headers.items, 0..) |hdr, i| {
+            if (hdr.source == .user_agent and std.ascii.eqlIgnoreCase(hdr.name, "origin")) {
+                _ = transfer.req_headers.orderedRemove(i);
+                break;
+            }
+        }
+        return;
+    }
+
+    try transfer.setHeader("Origin", transfer.effectiveOrigin(), .{});
 }
 
 // RobotsGate resumption.
@@ -1312,8 +1375,9 @@ const SyncContext = struct {
         const self: *SyncContext = @ptrCast(@alignCast(transfer.req.ctx));
         lp.assert(transfer.responseStatus() != null, "HttpClient.SyncRequest.headerCallback", .{ .value = transfer.responseStatus() });
         self.status = transfer.responseStatus().?;
-        if (transfer.getContentLength()) |cl| {
-            try self.body.ensureTotalCapacityPrecise(try self.bodyAllocator(cl), cl);
+        const body_len = transfer.bodyLen();
+        if (body_len > 0) {
+            try self.body.ensureTotalCapacityPrecise(try self.bodyAllocator(body_len), body_len);
         }
         return .proceed;
     }
@@ -1437,23 +1501,33 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
 
         defer msg.deinit();
 
-        switch (msg.payload) {
-            .cdp, .bidi => driver.onMessage(msg) catch |err| {
-                // A single malformed/failed dispatch shouldn't poison
-                // the rest of the batch — log and continue.
-                log.err(.app, "client dispatch", .{ .err = err });
+        const done = switch (msg.payload) {
+            .cdp, .bidi => blk: {
+                driver.onMessage(msg) catch |err| {
+                    // A single malformed/failed dispatch shouldn't poison
+                    // the rest of the batch — log and continue.
+                    log.err(.app, "client dispatch", .{ .err = err });
+                };
+                break :blk false;
             },
-            .ping => |body| driver.onPing(body),
-            .close => {
-                driver.onClose();
-                self.disconnected = true;
-                return error.ClientDisconnected;
+            .ping => |body| blk: {
+                driver.onPing(body);
+                break :blk false;
             },
-            .disconnect => |err| {
-                driver.onDisconnect(err);
-                self.disconnected = true;
-                return error.ClientDisconnected;
+            .link => |link| blk: {
+                driver.onLink(link);
+                break :blk false;
             },
+            .quit => blk: {
+                driver.onQuit();
+                break :blk true; // quit always shutsdown
+            },
+            .close => driver.onClose(), // close is up to the driver if it shutsdown
+            .disconnect => |err| driver.onDisconnect(err), // same with disconnect
+        };
+        if (done) {
+            self.disconnected = true;
+            return error.ClientDisconnected;
         }
     }
 }
@@ -1472,7 +1546,7 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
 // eval frame above us will dereference.
 fn allowDuringSyncWait(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .ping, .close, .disconnect => true,
+        .ping, .close, .disconnect, .quit, .link => true,
         .cdp => |c| isFetchInterceptionMethod(c.input.method),
         // BiDi has no request interception yet, so nothing it can send is
         // safe to dispatch from inside a JS callback.
@@ -1482,8 +1556,8 @@ fn allowDuringSyncWait(msg: *Inbox.Message) bool {
 
 fn isTerminal(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .close, .disconnect => true,
-        .ping, .cdp, .bidi => false,
+        .close, .disconnect, .quit => true,
+        .ping, .cdp, .bidi, .link => false,
     };
 }
 
@@ -1500,8 +1574,8 @@ fn isFetchInterceptionMethod(method: []const u8) bool {
 // teardown command sits undispatched behind the sync_wait allowlist.
 fn isSyncWaitInterrupt(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
-        .close, .disconnect => true,
-        .ping => false,
+        .close, .disconnect, .quit => true,
+        .ping, .link => false,
         .cdp => |c| isTeardownMethod(c.input.method),
         // Frames aren't parsed on the Network thread for BiDi, so we
         // can't spot a teardown command without re-parsing here.
@@ -1788,12 +1862,12 @@ fn ensureNoActiveConnection(self: *const Client) !void {
 }
 
 pub const Request = struct {
-    pub const StartCallback = *const fn (transfer: *Transfer) anyerror!void;
-    pub const HeaderCallback = *const fn (transfer: *Transfer) anyerror!Transfer.HeaderResult;
-    pub const DataCallback = *const fn (transfer: *Transfer, data: []const u8) anyerror!void;
-    pub const DoneCallback = *const fn (ctx: *anyopaque) anyerror!void;
-    pub const ErrorCallback = *const fn (ctx: *anyopaque, err: anyerror) void;
-    pub const ShutdownCallback = *const fn (ctx: *anyopaque) void;
+    const StartCallback = *const fn (transfer: *Transfer) anyerror!void;
+    const HeaderCallback = *const fn (transfer: *Transfer) anyerror!Transfer.HeaderResult;
+    const DataCallback = *const fn (transfer: *Transfer, data: []const u8) anyerror!void;
+    const DoneCallback = *const fn (ctx: *anyopaque) anyerror!void;
+    const ErrorCallback = *const fn (ctx: *anyopaque, err: anyerror) void;
+    const ShutdownCallback = *const fn (ctx: *anyopaque) void;
 
     pub const ResourceType = enum {
         document,
@@ -1825,7 +1899,7 @@ pub const Request = struct {
 
     // Fetch request redirect mode. `.follow` keeps navigations, XHR and
     // internal requests transparently following redirects.
-    pub const RedirectMode = enum { follow, manual, @"error" };
+    const RedirectMode = enum { follow, manual, @"error" };
 
     // How much of a headers_only body we'll read rather than abort. Draining
     // costs bandwidth but keeps the connection poolable; aborting saves
@@ -1934,7 +2008,7 @@ pub const Request = struct {
     }
 };
 
-pub const SyncResponse = struct {
+const SyncResponse = struct {
     status: u16,
     body: std.ArrayList(u8),
 
@@ -2080,31 +2154,39 @@ pub const Owner = struct {
     transfers: std.DoublyLinkedList = .{},
     websockets: std.DoublyLinkedList = .{},
 
-    // The Page-level blob: URL store, shared by every context on the page.
-    blob_urls: *const Blob.UrlMap,
+    // The global these requests are made on behalf of.
+    scope: GlobalScope,
 
-    // The owning Frame's / WorkerGlobalScope's origin slot. Pointer because
-    // it can change during navigation.
-    origin: *const ?[]const u8,
-
-    // The owning Frame's URL slot, a pointer for the same reason. A worker
-    // has none: its site for cookies is its creating document's.
+    // The owning Frame's URL slot. A pointer because it changes during
+    // navigation; a worker has none, its site for cookies is its creating
+    // document's. (We don't use scope beause unit tests fake this, `testOwner`)
     url: ?*const [:0]const u8,
 
     // The parent frame's Owner; for a worker, its creating frame's. Outlives
     // this Owner: child frames are torn down before their parent, a worker
-    // before its frame.
+    // before its frame. A `.document` request's owner is the frame it
+    // navigates, so a parent here is what makes that load a nested frame's;
+    // the adblocker tells $document from $subdocument by it.
     parent: ?*const Owner,
 
     // Copied onto every request made through this owner, see Request.
     frame_id: u32,
     document_frame_id: u32,
     loader_id: u32,
-    cookie_jar: *CookieJar,
-    performance: *Performance,
-    notification: *Notification,
 
     const Blob = @import("../browser/webapi/Blob.zig");
+
+    /// The URL of the document this owner's requests belong to.
+    /// Handles `about:` case also.
+    pub fn documentUrl(self: *const Owner) ?[:0]const u8 {
+        var source = self;
+        while (true) {
+            if (source.url) |url| {
+                if (!std.mem.startsWith(u8, url.*, "about:")) return url.*;
+            }
+            source = source.parent orelse return null;
+        }
+    }
 
     // RFC 6265bis "site for cookies"
     pub fn siteForCookies(self: *const Owner) Cookie.SiteForCookies {
@@ -2131,11 +2213,11 @@ pub const Owner = struct {
         return .{ .url = own_url };
     }
 
-    pub fn addTransfer(self: *Owner, t: *Transfer) void {
+    fn addTransfer(self: *Owner, t: *Transfer) void {
         self.transfers.append(&t.owner_node);
     }
 
-    pub fn removeTransfer(self: *Owner, t: *Transfer) void {
+    fn removeTransfer(self: *Owner, t: *Transfer) void {
         self.transfers.remove(&t.owner_node);
     }
 
@@ -2237,6 +2319,10 @@ pub const Transfer = struct {
 
     // Content length reported on the CDP loadingFinished event.
     _content_length: usize = 0,
+
+    // Length of the body data_callback will receive. Can be different than
+    // Content-Length if the content was compressed
+    _body_len: usize = 0,
 
     _conn_id: i64 = 0,
     _conn_reused: bool = false,
@@ -2855,7 +2941,7 @@ pub const Transfer = struct {
             owner.parent orelse return null
         else
             owner;
-        return .{ .performance = target.performance, .origin = target.origin.* };
+        return .{ .performance = target.scope.performance(), .origin = target.scope.origin() };
     }
 
     // https://fetch.spec.whatwg.org/#concept-tao-check
@@ -2982,6 +3068,7 @@ pub const Transfer = struct {
             lp.metrics.http_response_size_bytes.observe(body.len);
         }
 
+        self._body_len = body.len;
         try self._events.ensureUnusedCapacity(self.arena.allocator(), 4);
         self._events.appendAssumeCapacity(.start);
         self._events.appendAssumeCapacity(.header);
@@ -3121,6 +3208,8 @@ pub const Transfer = struct {
         try conn.setMethod(req.method);
         if (req.body) |b| {
             try conn.setBody(b);
+        } else if (req.method == .HEAD) {
+            try conn.setNoBody();
         } else {
             try conn.setGetMode();
         }
@@ -3132,6 +3221,16 @@ pub const Transfer = struct {
         const arena = self.arena.allocator();
         for (self.req_headers.items) |hdr| {
             try conn.addHeader(arena, hdr.name, hdr.value);
+        }
+        if (req.body != null and self.findRequestHeader("content-type") == null) {
+            // Prevent libcurl from always setting application/x-www-form-urlencoded
+            try conn.addRawHeader("Content-Type:");
+        }
+        if (req.body == null and (req.method == .POST or req.method == .PUT) and
+            self.findRequestHeader("content-length") == null)
+        {
+            // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch step 10
+            try conn.addRawHeader("Content-Length: 0");
         }
         if (req.body != null) {
             // Browsers never send Expect: 100-continue; libcurl generates it
@@ -3202,7 +3301,9 @@ pub const Transfer = struct {
             .redirect_count = self._redirect_count,
         };
 
-        if (conn.getResponseHeader("content-type", 0)) |ct| {
+        if (conn.getResponseHeader("content-type", 0)) |first| {
+            // last one wins
+            const ct = if (first.amount < 2) first else conn.getResponseHeader("content-type", first.amount - 1) orelse first;
             var hdr = &self.res.header.?;
             const value = ct.value;
             const len = @min(value.len, http.ResponseHead.MAX_CONTENT_TYPE_LEN);
@@ -3217,7 +3318,7 @@ pub const Transfer = struct {
     }
 
     // `url` must have transfer-arena lifetime: it's stored as-is, not duped.
-    pub fn updateURL(self: *Transfer, url: [:0]const u8) !void {
+    fn updateURL(self: *Transfer, url: [:0]const u8) !void {
         self.req.url = url;
     }
 
@@ -3357,7 +3458,7 @@ pub const Transfer = struct {
         self.req.basic_auth_credentials = userpwd;
     }
 
-    pub const RequestHeader = struct {
+    const RequestHeader = struct {
         name: []const u8,
         value: []const u8,
         source: HeaderSource = .user_agent,
@@ -3367,9 +3468,9 @@ pub const Transfer = struct {
     // setHeader/appendHeader let a source overwrite headers from its own or
     // a lower layer, never a higher one. .fixed is hardcoded and can't be
     // changed (Sec-Ch-Ua). For CORS, only script-set headers cause a preflight.
-    pub const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
+    const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
 
-    pub const HeaderOpts = struct {
+    const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
     };
 
@@ -3542,6 +3643,13 @@ pub const Transfer = struct {
                         res.callback_error = error.ResponseTooLarge;
                         return http.writefunc_error;
                     }
+                    // TODO: Because of compression, Content-Length is the wire
+                    // length, not necessarily the final length. The chunks
+                    // are read into the transfer.*ARENA* so growth doesn't free
+                    // previous allocations. We could look at Content-Encoding
+                    // and `cl * 3` or something, but that's just a guess.
+                    // I prefer to leave this simple; easier for someone to come
+                    // up with a good solution.
                     res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
                 }
             }
@@ -3664,6 +3772,14 @@ pub const Transfer = struct {
     pub fn getContentLength(self: *const Transfer) ?usize {
         const cl = self.getContentLengthRawValue() orelse return null;
         return std.fmt.parseInt(usize, cl, 10) catch null;
+    }
+
+    // Unless streaming, we've read the entire body before calling
+    // header_callback. Code that needs to own the body (most callers) should
+    // use the body length NOT the Content-Length (which would be the compressed
+    // on-the-wire size, not the actual final length). 0 for streaming.
+    pub fn bodyLen(self: *const Transfer) usize {
+        return self._body_len;
     }
 
     fn getContentLengthRawValue(self: *const Transfer) ?[]const u8 {
@@ -3967,10 +4083,10 @@ const Synthetic = struct {
 
             const owner = transfer.owner orelse return error.BlobNotFound;
             const key = url[0 .. std.mem.indexOfScalar(u8, url, '#') orelse url.len];
-            if (!Owner.Blob.urlBelongsToOrigin(key, owner.origin.*)) {
+            if (!Owner.Blob.urlBelongsToOrigin(key, owner.scope.origin())) {
                 return error.BlobNotFound;
             }
-            const blob = (owner.blob_urls.get(key) orelse return error.BlobNotFound).blob;
+            const blob = (owner.scope.blobUrls().get(key) orelse return error.BlobNotFound).blob;
             // blob can be removed by the time we run, dupe it.
             content_type = try arena.dupe(u8, blob._mime);
             body = try arena.dupe(u8, blob._slice);
@@ -3990,20 +4106,16 @@ const Synthetic = struct {
 
 const testing = @import("../testing.zig");
 
-// Only the transfer list matters to the tests using it: they build their
-// transfers by hand and never go through newRequest.
-fn testOwner() Owner {
+// Only the transfer list, the url and the parent matter to the tests using
+// it: they build their transfers by hand and never go through newRequest.
+fn testOwner(url: ?*const [:0]const u8, parent: ?*const Owner) Owner {
     return .{
-        .blob_urls = undefined,
-        .origin = undefined,
-        .url = null,
-        .parent = null,
+        .scope = undefined,
+        .url = url,
+        .parent = parent,
         .frame_id = 0,
         .document_frame_id = 0,
         .loader_id = 0,
-        .cookie_jar = undefined,
-        .notification = undefined,
-        .performance = undefined,
     };
 }
 const AdBlocker = @import("adblock/AdBlocker.zig");
@@ -4189,6 +4301,7 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
         .single_flight = .init(testing.allocator),
     };
     client.url_blocklist = null;
+    client.accept_language_override = null;
     client.test_fail_submit = null;
     // isUrlBlocked reaches through here for the adblocker; tests that want
     // one assign it to `client.network` after this returns.
@@ -4217,7 +4330,76 @@ test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
     try testing.expectEqual(null, client.url_blocklist);
 }
 
-test "HttpClient: adblock verdicts apply per request hostname" {
+test "HttpClient: setAcceptLanguageOverride owns, replaces, and clears" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    defer client.clearAcceptLanguageOverride();
+
+    var first = "de-DE,de;q=0.9".*;
+    try client.setAcceptLanguageOverride(&first);
+    @memset(&first, 'x');
+    try std.testing.expectEqualStrings("de-DE,de;q=0.9", client.getAcceptLanguage());
+    try testing.expectEqual(2, client.getLanguages().len);
+
+    try client.setAcceptLanguageOverride("fr-FR");
+    try std.testing.expectEqualStrings("fr-FR", client.getLanguages()[0]);
+
+    client.clearAcceptLanguageOverride();
+    try testing.expectEqual(null, client.accept_language_override);
+}
+
+const TestRequest = struct {
+    url: [:0]const u8,
+    document: [:0]const u8 = "",
+    /// The page embedding `document`, when the test wants a deeper chain.
+    parent_document: [:0]const u8 = "",
+    resource_type: Request.ResourceType = .document,
+    internal: bool = false,
+};
+
+fn testIsUrlBlocked(client: *const Client, opts: TestRequest) bool {
+    // The owner chain a real request carries: [0] the embedding page,
+    // [1] the request's document, [2] the frame being navigated — whose url
+    // slot already holds the target, so its context is its parent's.
+    var chain: [3]Owner = undefined;
+    chain[0] = testOwner(
+        if (opts.parent_document.len == 0) null else &opts.parent_document,
+        null,
+    );
+    chain[1] = testOwner(
+        if (opts.document.len == 0) null else &opts.document,
+        if (opts.parent_document.len == 0) null else &chain[0],
+    );
+    chain[2] = testOwner(&opts.url, if (opts.document.len == 0) null else &chain[1]);
+
+    var transfer: Transfer = .{
+        .arena = undefined,
+        .owner = if (opts.resource_type == .document)
+            &chain[2]
+        else if (opts.document.len == 0)
+            null
+        else
+            &chain[1],
+        .req = .{
+            .method = .GET,
+            .url = opts.url,
+            .origin = null,
+            .credentials_mode = .omit,
+            .request_mode = .no_cors,
+            .resource_type = opts.resource_type,
+            .internal = opts.internal,
+            .shutdown_callback = noopShutdown,
+        },
+        .client = undefined,
+        .start_time = 0,
+    };
+    return client.isUrlBlocked(&transfer);
+}
+
+test "HttpClient: adblock verdicts apply per request" {
     var pool = ArenaPool.init(testing.allocator, .{});
     defer pool.deinit();
 
@@ -4229,18 +4411,107 @@ test "HttpClient: adblock verdicts apply per request hostname" {
     var list: std.Io.Reader = .fixed(
         \\||ads.example.com^
         \\@@||good.ads.example.com^
+        \\||typed.example.com^$script
+        \\||partied.example.com^$third-party
+        \\||framed.example.com^$subdocument
+        \\/\/[a-z]{4}\.js$/$match-case,script
     );
     try blocker.parse(&list);
+    try blocker.build();
     client.network.adblocker = blocker;
     defer client.network.adblocker = null;
 
-    try testing.expect(client.isUrlBlocked("https://ads.example.com/pixel.gif", false));
+    // A regex filter reads the URL as requested: case kept, fragment gone.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/abcd.js",
+        .resource_type = .script,
+    }));
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/abcd.js#v2",
+        .resource_type = .script,
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://cdn.example.com/ABCD.js",
+        .resource_type = .script,
+    }));
+
+    try testing.expect(testIsUrlBlocked(&client, .{ .url = "https://ads.example.com/pixel.gif" }));
     // Hostnames are matched case-insensitively and without the port.
-    try testing.expect(client.isUrlBlocked("https://SUB.ADS.EXAMPLE.COM:8443/x", false));
-    try testing.expect(!client.isUrlBlocked("https://good.ads.example.com/app.js", false));
-    try testing.expect(!client.isUrlBlocked("https://example.com/", false));
+    try testing.expect(testIsUrlBlocked(&client, .{ .url = "https://SUB.ADS.EXAMPLE.COM:8443/x" }));
+    try testing.expect(!testIsUrlBlocked(&client, .{ .url = "https://good.ads.example.com/app.js" }));
+    try testing.expect(!testIsUrlBlocked(&client, .{ .url = "https://example.com/" }));
     // Internal transfers (robots.txt, ...) are never adblocked.
-    try testing.expect(!client.isUrlBlocked("https://ads.example.com/", true));
+    try testing.expect(!testIsUrlBlocked(&client, .{ .url = "https://ads.example.com/", .internal = true }));
+
+    // The request's own type decides, not just its hostname.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://typed.example.com/a.js",
+        .resource_type = .script,
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://typed.example.com/a.json",
+        .resource_type = .xhr,
+    }));
+
+    // A `.document` request is $subdocument only inside a nested frame,
+    // which its owner chain tells: the navigated frame has a parent.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://framed.example.com/",
+        .document = "https://news.com/",
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{ .url = "https://framed.example.com/" }));
+
+    // The document URL decides the party; without one the request is first
+    // party to itself.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://partied.example.com/x.js",
+        .document = "https://news.com/",
+        .resource_type = .script,
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://partied.example.com/x.js",
+        .document = "https://www.partied.example.com/",
+        .resource_type = .script,
+    }));
+
+    // A top-level navigation is its own context: the page it was clicked on
+    // is not in its owner chain (it only travels as cookie_origin, which the
+    // adblocker never reads), so nothing makes it third-party...
+    try testing.expect(!testIsUrlBlocked(&client, .{ .url = "https://partied.example.com/" }));
+    // ...but a subframe loading the same URL keeps its document's context.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://partied.example.com/",
+        .document = "https://news.com/",
+    }));
+
+    // The context is the issuing frame's document even under a cross-site
+    // ancestor (the canonical ad iframe) — site-for-cookies semantics would
+    // collapse this chain to nothing and lose the party.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://partied.example.com/x.js",
+        .document = "https://adprovider.com/frame.html",
+        .parent_document = "https://news.com/",
+        .resource_type = .script,
+    }));
+
+    // A document hostname DNS could not carry is nothing a filter list has
+    // an opinion about: the request is let through, not matched sourceless.
+    try testing.expect(testIsUrlBlocked(&client, .{
+        .url = "https://ads.example.com/pixel.gif",
+        .document = "https://news.com/",
+        .resource_type = .image,
+    }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://ads.example.com/pixel.gif",
+        .document = "https://" ++ "a" ** 254 ++ ".com/",
+        .resource_type = .image,
+    }));
+    // Same for a URL too long to normalize (uppercase forces the copy).
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://ads.example.com/" ++ "A" ** (8 * 1024),
+        .document = "https://news.com/",
+        .resource_type = .image,
+    }));
 }
 
 test "HttpClient: URL blocking exempts internal transfers" {
@@ -4252,8 +4523,11 @@ test "HttpClient: URL blocking exempts internal transfers" {
     defer client.clearUrlBlocklist();
 
     try client.setBlockedUrls(&.{"*example.test*"});
-    try testing.expect(client.isUrlBlocked("https://example.test/script.js", false));
-    try testing.expect(!client.isUrlBlocked("https://example.test/robots.txt", true));
+    try testing.expect(testIsUrlBlocked(&client, .{ .url = "https://example.test/script.js" }));
+    try testing.expect(!testIsUrlBlocked(&client, .{
+        .url = "https://example.test/robots.txt",
+        .internal = true,
+    }));
 }
 
 fn testTransfer(arena: *lp.Arena) Transfer {
@@ -4402,21 +4676,21 @@ test "HttpClient: Fetch header overrides restore after one hop" {
 
 test "HttpClient: Owner.siteForCookies" {
     var top_url: [:0]const u8 = "http://attacker.example/attacker-nested";
-    var top = testOwner();
+    var top = testOwner(null, null);
     top.url = &top_url;
 
     var middle_url: [:0]const u8 = "http://victim.example/nested-middle";
-    var middle = testOwner();
+    var middle = testOwner(null, null);
     middle.url = &middle_url;
     middle.parent = &top;
 
     var inner_url: [:0]const u8 = "http://victim.example/inner";
-    var inner = testOwner();
+    var inner = testOwner(null, null);
     inner.url = &inner_url;
     inner.parent = &middle;
 
     // A worker has no site of its own; it takes its creating document's.
-    var worker = testOwner();
+    var worker = testOwner(null, null);
     worker.parent = &inner;
 
     // A top-level document is its own site.
@@ -4469,7 +4743,7 @@ test "HttpClient: fulfillIntercepted survives a done_callback that tears down th
     defer client.processGraveyard();
     defer client.transfers.deinit(testing.allocator);
 
-    var owner = testOwner();
+    var owner = testOwner(null, null);
 
     const Ctx = struct {
         client: *Client,
@@ -4542,7 +4816,7 @@ test "HttpClient: kill during done_callback does not also fire shutdown_callback
     defer client.processGraveyard();
     defer client.transfers.deinit(testing.allocator);
 
-    var owner = testOwner();
+    var owner = testOwner(null, null);
 
     const Ctx = struct {
         client: *Client,
@@ -4622,7 +4896,7 @@ test "HttpClient: kill during a non-terminal callback defers shutdown_callback" 
     defer client.processGraveyard();
     defer client.transfers.deinit(testing.allocator);
 
-    var owner = testOwner();
+    var owner = testOwner(null, null);
 
     const Ctx = struct {
         client: *Client,
@@ -4689,6 +4963,70 @@ test "HttpClient: kill during a non-terminal callback defers shutdown_callback" 
     try testing.expectEqual(false, ctx.done_called);
 
     try testing.expectEqual(0, client.intercepted);
+    try testing.expectEqual(0, client.transfers.count());
+    try testing.expectEqual(null, owner.transfers.first);
+}
+
+test "HttpClient: bodyLen is the buffered body, not Content-Length" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    // Runs before pool.deinit (LIFO): retired arenas must go back first.
+    defer client.processGraveyard();
+    defer client.transfers.deinit(testing.allocator);
+
+    var owner = testOwner(null, null);
+
+    const Ctx = struct {
+        body_len: usize = 0,
+        content_length: ?usize = null,
+
+        fn headerCallback(transfer: *Transfer) !Transfer.HeaderResult {
+            const self: *@This() = @ptrCast(@alignCast(transfer.req.ctx));
+            self.body_len = transfer.bodyLen();
+            self.content_length = transfer.getContentLength();
+            return .proceed;
+        }
+    };
+    var ctx = Ctx{};
+
+    const arena = try pool.acquire(.small, "test");
+    const transfer = try arena.create(Transfer);
+    transfer.* = .{
+        .arena = arena,
+        .owner = null,
+        .req = .{
+            .method = .GET,
+            .url = "http://example.com/",
+            .origin = null,
+            .credentials_mode = .omit,
+            .request_mode = .no_cors,
+            .resource_type = .xhr,
+            .shutdown_callback = noopShutdown,
+            .ctx = &ctx,
+            .header_callback = Ctx.headerCallback,
+        },
+        .client = &client,
+        .id = 1,
+        .start_time = 0,
+    };
+
+    try client.transfers.putNoClobber(testing.allocator, transfer.id, transfer);
+    owner.addTransfer(transfer);
+    transfer.owner = &owner;
+
+    transfer.park(.intercept_request);
+    client.intercepted += 1;
+    try client.fulfillIntercepted(transfer, 200, &.{
+        .{ .name = "Content-Length", .value = "323838382838" },
+    }, "hello");
+    _ = client.dispatchCompleted(.all);
+
+    try testing.expectEqual(323838382838, ctx.content_length);
+    try testing.expectEqual(5, ctx.body_len);
+
     try testing.expectEqual(0, client.transfers.count());
     try testing.expectEqual(null, owner.transfers.first);
 }
@@ -4937,7 +5275,7 @@ test "HttpClient: abortParked survives an error_callback that tears down the own
     defer client.processGraveyard();
     defer client.transfers.deinit(testing.allocator);
 
-    var owner = testOwner();
+    var owner = testOwner(null, null);
 
     const Ctx = struct {
         client: *Client,
@@ -5011,7 +5349,7 @@ test "HttpClient: abort survives an error_callback that tears down the owner" {
     defer client.processGraveyard();
     defer client.transfers.deinit(testing.allocator);
 
-    var owner = testOwner();
+    var owner = testOwner(null, null);
 
     const Ctx = struct {
         client: *Client,

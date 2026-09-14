@@ -172,12 +172,15 @@ const OpenContext = struct {
     // open request's outcome.
     fn finishUpgrade(self: *OpenContext, txn: *IDBTransaction) !void {
         const exec = self.exec;
-        const aborted = txn.aborted();
+        const db = txn._db;
+        // Our pin is often the last one, so releasing it frees `txn` (its
+        // arena goes back to the pool). Read everything we need first.
+        const failed = txn.aborted() or db._closed;
         self.request._txn = .none;
-        txn._db._txn = null;
+        db._txn = null;
         txn.releaseRef(exec.page);
 
-        if (aborted or txn._db._closed) {
+        if (failed) {
             self.request._result = .{ .none = js.Undefined{} };
             self.request.setError(error.AbortError);
             return self.request.deliver(exec);
@@ -386,10 +389,10 @@ const DeleteContext = struct {
     }
 };
 
-pub fn databases(_: *IDBFactory, exec: *Execution) !js.Promise {
+fn databases(_: *IDBFactory, exec: *Execution) !js.Promise {
     const local = exec.js.local.?;
     // unavailable for opaque origins, e.g. about:blank
-    const origin = exec.origin() orelse return local.rejectPromise(.{ .dom_exception = .{ .err = error.SecurityError } });
+    const origin = exec.origin() orelse return error.SecurityError;
     const engine = try exec.session.idb.engineForOrigin(origin);
     return local.resolvePromise(try engine.databases(exec.call_arena));
 }
