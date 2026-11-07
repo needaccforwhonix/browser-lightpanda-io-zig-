@@ -140,7 +140,7 @@ pub fn stop(self: *Spinner) void {
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / @as(f64, std.time.ms_per_s);
 
     var buf: [frame_buf_bytes]u8 = undefined;
-    const summary = std.fmt.bufPrint(
+    const summary = std.mem.print(
         &buf,
         "\r" ++ clear_eol ++ ansi.dim ++ "[agent: worked for {d:.1}s · {d} tool call{s}]" ++ ansi.reset ++ "\n",
         .{ elapsed_s, self.tool_calls, if (self.tool_calls == 1) "" else "s" },
@@ -266,7 +266,10 @@ fn workerLoop(self: *Spinner) void {
         self.renderLocked();
 
         self.frame = (self.frame + 1) % @as(u8, @intCast(braille.len));
-        lp.timedWait(&self.cv, &self.mu, interval_ns) catch {};
+        self.cv.waitTimeout(lp.io, &self.mu, .{ .duration = .{
+            .raw = .fromNanoseconds(interval_ns),
+            .clock = .awake,
+        } }) catch {};
     }
 }
 
@@ -275,7 +278,7 @@ fn renderLocked(self: *Spinner) void {
     const glyph = braille[self.frame % braille.len];
     const written = switch (self.state) {
         .idle => return,
-        .thinking => std.fmt.bufPrint(
+        .thinking => std.mem.print(
             &buf,
             "\r" ++ ansi.yellow ++ "{s}" ++ ansi.reset ++ " " ++ ansi.dim ++ "[agent: thinking]" ++ ansi.reset ++ clear_eol,
             .{glyph},
@@ -297,7 +300,7 @@ fn renderLocked(self: *Spinner) void {
             const cap = @min(max_args_cells, room);
             const cut = truncToCells(all_args, cap);
             const suffix: []const u8 = if (cut < all_args.len) ellipsis else "";
-            break :blk std.fmt.bufPrint(
+            break :blk std.mem.print(
                 &buf,
                 "\r" ++ ansi.yellow ++ "{s}" ++ ansi.reset ++ " " ++ ansi.dim ++ "[{s}{s} {s}{s}]" ++ ansi.reset ++ clear_eol,
                 .{ glyph, prefix, name, all_args[0..cut], suffix },

@@ -65,7 +65,7 @@ pub fn collectLinks(arena: Allocator, root: *Node, frame: *Frame) ![]Link {
     var labels: Label.LabelByForIndex = .{};
 
     if (Selector.querySelectorAll(root, "a[href]", frame)) |list| {
-        defer list.deinit(frame._page);
+        defer list.deinit(frame.page);
 
         for (list._nodes) |node| {
             const anchor = node.is(Element.Html.Anchor) orelse continue;
@@ -73,7 +73,7 @@ pub fn collectLinks(arena: Allocator, root: *Node, frame: *Frame) ![]Link {
             if (!el.isVisible(frame)) continue;
 
             const href = anchor.getHref(frame) catch |err| {
-                log.err(.app, "resolve href failed", .{ .err = err });
+                log.debug(.app, "resolve href failed", .{ .err = err });
                 continue;
             };
             if (href.len == 0) continue;
@@ -90,7 +90,7 @@ pub fn collectLinks(arena: Allocator, root: *Node, frame: *Frame) ![]Link {
             };
         }
     } else |err| {
-        log.err(.app, "query links failed", .{ .err = err });
+        log.debug(.app, "query links failed", .{ .err = err });
         return err;
     }
 

@@ -87,7 +87,7 @@ fn getPreserveAspectRatio(self: *Svg, frame: *Frame) !*AnimatedPreserveAspectRat
 }
 
 fn createSVGPoint(_: *Svg, frame: *Frame) !*DOMPoint {
-    const point = try DOMPoint.create(0, 0, 0, 1, frame._page);
+    const point = try DOMPoint.create(0, 0, 0, 1, frame.page);
     point._proto.restrict();
     return point;
 }
@@ -99,7 +99,7 @@ fn createSVGMatrix(_: *Svg, frame: *Frame) !*DOMMatrix {
         0, 0, 1, 0,
         0, 0, 0, 1,
     };
-    return DOMMatrix.create(identity, true, frame._page);
+    return DOMMatrix.create(identity, true, frame.page);
 }
 
 fn createSVGRect(_: *Svg, frame: *Frame) !*DOMRect {
@@ -131,7 +131,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "SVGSVGElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

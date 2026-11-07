@@ -17,7 +17,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
 const js = @import("js.zig");
 const v8 = js.v8;
 
@@ -25,8 +24,12 @@ const TaggedOpaque = @import("TaggedOpaque.zig");
 
 const Allocator = std.mem.Allocator;
 
-const CONTEXT_GROUP_ID = 1;
 const CLIENT_TRUST_LEVEL = 1;
+
+// A context group is the set of contexts a Session sees. CDP uses one group
+// per page target (see BrowserContext.next_group_id), so a session attached
+// to one page doesn't see the other pages' contexts. Must not be 0.
+pub const GroupId = c_int;
 
 // Inspector exists for the lifetime of the Isolate/Env. 1 Isolate = 1 Inspector.
 // It combines the v8.Inspector and the v8.InspectorClientImpl. The v8.InspectorClientImpl
@@ -41,8 +44,8 @@ unique_id: i64,
 isolate: *v8.Isolate,
 handle: *v8.Inspector,
 client: *v8.InspectorClientImpl,
-default_context: ?v8.Global,
-session: ?Session,
+allocator: Allocator,
+default_contexts: std.AutoHashMapUnmanaged(GroupId, v8.Global) = .empty,
 
 pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
     const self = try allocator.create(Inspector);
@@ -50,11 +53,10 @@ pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
 
     self.* = .{
         .unique_id = 1,
-        .session = null,
         .isolate = isolate,
         .client = undefined,
         .handle = undefined,
-        .default_context = null,
+        .allocator = allocator,
     };
 
     self.client = v8.v8_inspector__Client__IMPL__CREATE();
@@ -67,32 +69,17 @@ pub fn init(allocator: Allocator, isolate: *v8.Isolate) !*Inspector {
     return self;
 }
 
-pub fn deinit(self: *const Inspector, allocator: Allocator) void {
+pub fn deinit(self: *Inspector) void {
+    const allocator = self.allocator;
+
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
 
-    if (self.session) |*s| {
-        s.deinit();
-    }
     v8.v8_inspector__Client__IMPL__DELETE(self.client);
     v8.v8_inspector__Inspector__DELETE(self.handle);
+    self.default_contexts.deinit(allocator);
     allocator.destroy(self);
-}
-
-pub fn startSession(self: *Inspector, ctx: anytype) *Session {
-    if (comptime lp.IS_DEBUG) {
-        std.debug.assert(self.session == null);
-    }
-
-    self.session = @as(Session, undefined);
-    Session.init(&self.session.?, self, ctx);
-    return &self.session.?;
-}
-
-pub fn stopSession(self: *Inspector) void {
-    self.session.?.deinit();
-    self.session = null;
 }
 
 // From CDP docs
@@ -105,12 +92,17 @@ pub fn stopSession(self: *Inspector) void {
 // - is_default_context: Whether the execution context is default, should match the auxData
 pub fn contextCreated(
     self: *Inspector,
+    group_id: GroupId,
     local: *const js.Local,
     name: []const u8,
     origin: []const u8,
     aux_data: []const u8,
     is_default_context: bool,
-) void {
+) !void {
+    if (is_default_context) {
+        try self.default_contexts.put(self.allocator, group_id, local.ctx.handle);
+    }
+
     v8.v8_inspector__Inspector__ContextCreated(
         self.handle,
         name.ptr,
@@ -119,13 +111,9 @@ pub fn contextCreated(
         origin.len,
         aux_data.ptr,
         aux_data.len,
-        CONTEXT_GROUP_ID,
+        group_id,
         local.handle,
     );
-
-    if (is_default_context) {
-        self.default_context = local.ctx.handle;
-    }
 }
 
 pub fn getContextId(_: *const Inspector, local: *const js.Local) i32 {
@@ -135,19 +123,21 @@ pub fn getContextId(_: *const Inspector, local: *const js.Local) i32 {
 pub fn contextDestroyed(self: *Inspector, context: *const v8.Context) void {
     v8.v8_inspector__Inspector__ContextDestroyed(self.handle, context);
 
-    if (self.default_context) |*dc| {
-        if (v8.v8__Global__IsEqual(dc, context)) {
-            self.default_context = null;
+    var it = self.default_contexts.iterator();
+    while (it.next()) |kv| {
+        if (v8.v8__Global__IsEqual(kv.value_ptr, context)) {
+            self.default_contexts.removeByPtr(kv.key_ptr);
+            break;
         }
     }
 }
 
-pub fn resetContextGroup(self: *const Inspector) void {
+pub fn resetContextGroup(self: *const Inspector, group_id: GroupId) void {
     var hs: v8.HandleScope = undefined;
     v8.v8__HandleScope__CONSTRUCT(&hs, self.isolate);
     defer v8.v8__HandleScope__DESTRUCT(&hs);
 
-    v8.v8_inspector__Inspector__ResetContextGroup(self.handle, CONTEXT_GROUP_ID);
+    v8.v8_inspector__Inspector__ResetContextGroup(self.handle, group_id);
 }
 
 const RemoteObject = struct {
@@ -199,11 +189,15 @@ const RemoteObject = struct {
 // Combines a v8::InspectorSession and a v8::InspectorChannelImpl. The
 // InspectorSession is for zig -> v8 (sending messages to the inspector). The
 // Channel is for v8 -> zig, getting events from the Inspector (that we'll pass
-// back to some opaque context, i.e the CDP BrowserContext).
+// back to some opaque context, i.e the CDP AttachedSession).
+// The channel keeps the Session's address, so the owner must not move it
+// between init and deinit. A Session sees the contexts of the group it
+// connects to.
 // The channel callbacks are defined below, as:
 //   pub export fn v8_inspector__Channel__IMPL__XYZ
 pub const Session = struct {
     inspector: *Inspector,
+    group_id: GroupId,
     handle: *v8.InspectorSession,
     channel: *v8.InspectorChannelImpl,
 
@@ -212,13 +206,13 @@ pub const Session = struct {
     onNotif: *const fn (ctx: *anyopaque, msg: []const u8) void,
     onResp: *const fn (ctx: *anyopaque, call_id: u32, msg: []const u8) void,
 
-    fn init(self: *Session, inspector: *Inspector, ctx: anytype) void {
+    pub fn init(self: *Session, inspector: *Inspector, group_id: GroupId, ctx: anytype) void {
         const Container = @typeInfo(@TypeOf(ctx)).pointer.child;
 
         const channel = v8.v8_inspector__Channel__IMPL__CREATE(inspector.isolate);
         const handle = v8.v8_inspector__Inspector__Connect(
             inspector.handle,
-            CONTEXT_GROUP_ID,
+            group_id,
             channel,
             CLIENT_TRUST_LEVEL,
         ).?;
@@ -229,15 +223,28 @@ pub const Session = struct {
             .handle = handle,
             .channel = channel,
             .inspector = inspector,
+            .group_id = group_id,
             .onResp = Container.onInspectorResponse,
             .onNotif = Container.onInspectorEvent,
         };
     }
 
-    fn deinit(self: *const Session) void {
+    pub fn deinit(self: *Session) void {
+        // Deleting the V8 session fails its pending evaluations, which V8
+        // answers through the channel. The client is gone: drop them.
+        self.onResp = dropResponse;
+        self.onNotif = dropNotification;
+
+        var hs: v8.HandleScope = undefined;
+        v8.v8__HandleScope__CONSTRUCT(&hs, self.inspector.isolate);
+        defer v8.v8__HandleScope__DESTRUCT(&hs);
+
         v8.v8_inspector__Session__DELETE(self.handle);
         v8.v8_inspector__Channel__IMPL__DELETE(self.channel);
     }
+
+    fn dropResponse(_: *anyopaque, _: u32, _: []const u8) void {}
+    fn dropNotification(_: *anyopaque, _: []const u8) void {}
 
     pub fn send(self: *const Session, msg: []const u8) void {
         const isolate = self.inspector.isolate;
@@ -285,7 +292,7 @@ pub const Session = struct {
         local: *const js.Local,
         group: []const u8,
         value: anytype,
-    ) !RemoteObject {
+    ) !?RemoteObject {
         const js_val = try local.zigValueToJs(value, .{});
 
         // We do not want to expose this as a parameter for now
@@ -306,7 +313,7 @@ pub const Session = struct {
         val: *const v8.Value,
         grpname: []const u8,
         generatepreview: bool,
-    ) !RemoteObject {
+    ) ?RemoteObject {
         const remote_object = v8.v8_inspector__Session__wrapObject(
             self.handle,
             isolate,
@@ -315,7 +322,7 @@ pub const Session = struct {
             grpname.ptr,
             grpname.len,
             generatepreview,
-        ).?;
+        ) orelse return null; // not a context the inspector knows
         return .{ .handle = remote_object };
     }
 
@@ -363,7 +370,7 @@ const UnwrappedObject = struct {
     object_group: ?[]const u8,
 };
 
-pub fn getTaggedOpaque(value: *const v8.Value) ?*TaggedOpaque {
+pub fn getTaggedOpaque(value: *const v8.Value) ?TaggedOpaque {
     if (!v8.v8__Value__IsObject(value)) {
         return null;
     }
@@ -425,10 +432,11 @@ pub export fn v8_inspector__Client__IMPL__consoleAPIMessage(
 pub export fn v8_inspector__Client__IMPL__ensureDefaultContextInGroup(
     _: *v8.InspectorClientImpl,
     data: *anyopaque,
+    group_id: c_int,
 ) callconv(.c) ?*const v8.Context {
     const inspector: *Inspector = @ptrCast(@alignCast(data));
-    const global_handle = inspector.default_context orelse return null;
-    return v8.v8__Global__Get(&global_handle, inspector.isolate);
+    const global_handle = inspector.default_contexts.getPtr(group_id) orelse return null;
+    return v8.v8__Global__Get(global_handle, inspector.isolate);
 }
 
 pub export fn v8_inspector__Channel__IMPL__sendResponse(

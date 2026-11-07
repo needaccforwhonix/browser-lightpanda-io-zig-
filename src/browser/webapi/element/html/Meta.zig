@@ -124,7 +124,7 @@ fn immediateRefreshTarget(content: []const u8) ?[]const u8 {
 
     // The delay ends at the first separator. Without one, there's no URL.
     const separators = std.ascii.whitespace ++ [_]u8{ ';', ',' };
-    const separator = std.mem.indexOfAny(u8, trimmed, &separators) orelse return null;
+    const separator = std.mem.findAny(u8, trimmed, &separators) orelse return null;
     const seconds = std.fmt.parseFloat(f64, trimmed[0..separator]) catch return null;
     if (seconds != 0) {
         // For now, we skip any meta refresh where the delay isn't 0. It isn't
@@ -151,7 +151,7 @@ fn immediateRefreshTarget(content: []const u8) ?[]const u8 {
     if (rest.len > 0 and (rest[0] == '"' or rest[0] == '\'')) {
         const quote = rest[0];
         const quoted = rest[1..];
-        rest = quoted[0 .. std.mem.indexOfScalar(u8, quoted, quote) orelse quoted.len];
+        rest = quoted[0 .. std.mem.findScalar(u8, quoted, quote) orelse quoted.len];
     }
 
     const target = std.mem.trim(u8, rest, &std.ascii.whitespace);
@@ -161,6 +161,11 @@ fn immediateRefreshTarget(content: []const u8) ?[]const u8 {
 
 pub const Build = struct {
     pub fn created(node: *Node, frame: *Frame) !void {
+        // A document without a browsing context has no policy or refresh to set.
+        if (node.getDocument(frame)._frame == null) {
+            return;
+        }
+
         const self = node.as(Meta);
         const el = self.asElement();
 
@@ -187,7 +192,7 @@ pub const Build = struct {
         if (!name.eql(comptime .wrap("http-equiv")) and !name.eql(comptime .wrap("content"))) {
             return;
         }
-        return element.as(Meta).processRefresh(element.asNode().ownerFrame(frame));
+        return element.as(Meta).processRefresh(element.asNode().ownerFrame(frame) orelse return);
     }
 };
 
@@ -196,7 +201,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLMetaElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

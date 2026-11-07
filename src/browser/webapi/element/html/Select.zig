@@ -23,9 +23,9 @@ const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
-const Event = @import("../../Event.zig");
 const Element = @import("../../Element.zig");
 const collections = @import("../../collections.zig");
+const TreeWalker = @import("../../TreeWalker.zig");
 
 const HtmlElement = @import("../Html.zig");
 const reflection = @import("../reflection.zig");
@@ -62,61 +62,123 @@ pub fn asConstNode(self: *const Select) *const Node {
 // hooks. For this one off, I'm sticking with a direct call from Frame because
 // it's easier.
 pub fn childInserted(parent: *Node, child: *Node) void {
-    if (ListChange.isinList(parent, child) == false) {
+    if (mayHoldOptions(child) == false) {
         return;
     }
-    const select = ListChange.getSelect(parent) orelse return;
+    const pos = listPosition(parent) orelse return;
     var change: ListChange = .{};
-    change.add(child);
-    change.processInserted(select);
+    change.add(child, pos.in_optgroup);
+    change.processInserted(pos.select);
 }
 
 // parser.fragment links every child of a parent at once.
 pub fn childrenInserted(parent: *Node) void {
-    const select = ListChange.getSelect(parent) orelse return;
+    const pos = listPosition(parent) orelse return;
     var change: ListChange = .{};
     var it = parent.childrenIterator();
     while (it.next()) |child| {
-        if (ListChange.isinList(parent, child)) {
-            change.add(child);
-        }
+        change.add(child, pos.in_optgroup);
     }
-    change.processInserted(select);
+    change.processInserted(pos.select);
 }
 
 // Called by the Frame for every node, a removed option has to update its select.
 pub fn childRemoved(parent: *Node, child: *Node) void {
-    if (ListChange.isinList(parent, child) == false) {
+    if (mayHoldOptions(child) == false) {
         return;
     }
-    const select = ListChange.getSelect(parent) orelse return;
+    const pos = listPosition(parent) orelse return;
+    const select = pos.select;
     if (select.isMenuList() == false) {
         return;
     }
 
     var change: ListChange = .{};
-    change.add(child);
+    change.add(child, pos.in_optgroup);
     if (change.last_selected != null or select.selectedOption() == null) {
         select.selectFirstEnabled();
     }
 }
 
+// The parser links elements before their children, so this keeps the
+// ancestor walk off every node but options.
+fn mayHoldOptions(node: *Node) bool {
+    return node.is(Option) != null or (node.is(Element) != null and node.firstChild() != null);
+}
+
+// Where, in which select's list of options, an option placed under `parent`
+// lands: the nearest select ancestor, unless a select, hr, option or datalist
+// sits in between, or two optgroups do. HTML §get-the-list-of-options.
+pub const ListPosition = struct {
+    select: *Select,
+    // Under an optgroup already: a second one hides its options.
+    in_optgroup: bool,
+};
+
+pub fn listPosition(parent: *Node) ?ListPosition {
+    var in_optgroup = false;
+    var node: ?*Node = parent;
+    while (node) |n| : (node = n.parentNode()) {
+        if (n.is(Select)) |select| {
+            return .{ .select = select, .in_optgroup = in_optgroup };
+        }
+        in_optgroup = listStep(n, in_optgroup) orelse return null;
+    }
+    return null;
+}
+
+// One ancestor of the walk up from an option: null when it keeps its
+// descendants out of the list, else whether an optgroup has been passed.
+fn listStep(node: *Node, in_optgroup: bool) ?bool {
+    if (node.is(Element.Html.OptGroup) != null) {
+        return if (in_optgroup) null else true;
+    }
+    if (closesList(node)) {
+        return null;
+    }
+    return in_optgroup;
+}
+
+// Elements whose descendants are never in a list of options.
+fn closesList(node: *Node) bool {
+    return node.is(Option) != null or
+        node.is(Select) != null or
+        node.is(Element.Html.HR) != null or
+        node.is(Element.Html.DataList) != null;
+}
+
 // The options that nodes linked into, or unlinked from, a select's list of
-// options carry: options themselves, and an optgroup's option children.
+// options carry.
 const ListChange = struct {
     has_enabled: bool = false,
     last_selected: ?*Option = null,
 
-    fn add(self: *ListChange, child: *Node) void {
-        if (child.is(Option)) |option| {
-            self.addOption(option);
-            return;
-        }
-        var it = child.childrenIterator();
-        while (it.next()) |node| {
+    // `child` sits (or sat) at a position where `in_optgroup` holds. It is
+    // already unlinked on removal, so its options are judged from it down.
+    fn add(self: *ListChange, child: *Node, in_optgroup: bool) void {
+        var tw = TreeWalker.Full.init(child, .{});
+        while (tw.next()) |node| {
             if (node.is(Option)) |option| {
-                self.addOption(option);
+                if (node == child or inListBelow(node.parentNode().?, child, in_optgroup)) {
+                    self.addOption(option);
+                }
             }
+            if (closesList(node)) {
+                tw.skipChildren();
+            }
+        }
+    }
+
+    // Walks up from `node` to `top`, inclusive.
+    fn inListBelow(node: *Node, top: *Node, in_optgroup: bool) bool {
+        var state = in_optgroup;
+        var n = node;
+        while (true) {
+            state = listStep(n, state) orelse return false;
+            if (n == top) {
+                return true;
+            }
+            n = n.parentNode() orelse return false;
         }
     }
 
@@ -127,27 +189,6 @@ const ListChange = struct {
         if (self.has_enabled == false and option.asElement().isDisabled() == false) {
             self.has_enabled = true;
         }
-    }
-
-    fn getSelect(parent: *Node) ?*Select {
-        if (parent.is(Select)) |select| {
-            return select;
-        }
-        if (parent.is(Element.Html.OptGroup) == null) {
-            return null;
-        }
-        // optgroup's select
-        const grandparent = parent.parentNode() orelse return null;
-        return grandparent.is(Select);
-    }
-
-    fn isinList(parent: *Node, child: *Node) bool {
-        if (child.is(Option) != null) {
-            // an option is always in a select
-            return true;
-        }
-        // an optgroup may be in a select
-        return child.is(Element.Html.OptGroup) != null and parent.is(Select) != null;
     }
 
     fn processInserted(self: *const ListChange, select: *const Select) void {
@@ -176,38 +217,23 @@ pub fn optionSelectednessChanged(self: *const Select, option: *const Option) voi
     }
 }
 
-// Walks the select's list of options in tree order: its option children plus
-// the option children of its optgroup children, per HTML
-// §the-select-element. Options nested any deeper are not in the list.
+// Walks the select's list of options in tree order.
 const OptionIterator = struct {
-    _node: ?*Node,
-    _in_group: bool = false,
+    _select: *const Select,
+    _tw: TreeWalker.FullExcludeSelf,
 
     fn init(select: *const Select) OptionIterator {
-        return .{ ._node = select.asConstNode().firstChild() };
+        // TreeWalker only reads through the root
+        return .{ ._select = select, ._tw = .init(@constCast(select.asConstNode()), .{}) };
     }
 
     fn next(self: *OptionIterator) ?*Option {
-        while (self._node) |node| {
-            if (self._in_group == false and node.is(Element.Html.OptGroup) != null) {
-                if (node.firstChild()) |first_child| {
-                    self._in_group = true;
-                    self._node = first_child;
-                    continue;
-                }
+        while (self._tw.next()) |node| {
+            if (closesList(node)) {
+                self._tw.skipChildren();
             }
-
-            self._node = node.nextSibling() orelse blk: {
-                if (self._in_group == false) {
-                    break :blk null;
-                }
-                // Exhausted the optgroup, resume after it.
-                self._in_group = false;
-                const group = node.parentNode() orelse break :blk null;
-                break :blk group.nextSibling();
-            };
-
-            if (node.is(Option)) |option| {
+            const option = node.is(Option) orelse continue;
+            if (isInList(self._select, option)) {
                 return option;
             }
         }
@@ -215,11 +241,35 @@ const OptionIterator = struct {
     }
 };
 
+fn isInList(select: *const Select, option: *Option) bool {
+    const parent = option.asNode().parentNode() orelse return false;
+    const pos = listPosition(parent) orelse return false;
+    return pos.select == select;
+}
+
 fn deselectOthers(self: *const Select, keep: *const Option) void {
     var it = OptionIterator.init(self);
     while (it.next()) |option| {
         if (option != keep) option._selected = false;
     }
+}
+
+pub fn reset(self: *Select, frame: *Frame) void {
+    var last_selected: ?*Option = null;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| {
+        option._selected = option.asElement().hasAttributeInterned("selected");
+        if (option._selected) {
+            last_selected = option;
+        }
+    }
+    if (self.asElement().hasAttributeInterned("multiple") == false) {
+        if (last_selected) |keep| {
+            self.deselectOthers(keep);
+        }
+    }
+    self.resetToDefaultSelection();
+    frame.domChanged();
 }
 
 // HTML's "ask for a reset". Every path that selects an option in a
@@ -288,6 +338,17 @@ pub fn setValue(self: *Select, value: []const u8, frame: *Frame) !void {
     frame.domChanged();
 }
 
+/// The position of `option` in the list of options, or null when the option
+/// is not in it.
+pub fn optionIndex(self: *const Select, option: *const Option) ?u32 {
+    var index: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |o| : (index += 1) {
+        if (o == option) return index;
+    }
+    return null;
+}
+
 pub fn getSelectedIndex(self: *Select) i32 {
     var index: i32 = 0;
     var it = OptionIterator.init(self);
@@ -318,8 +379,7 @@ pub fn getType(self: *const Select) []const u8 {
 }
 
 fn getOptions(self: *Select, frame: *Frame) !*collections.HTMLOptionsCollection {
-    // select_options mode is the select's list of options: option children
-    // plus the option children of optgroup children.
+    // select_options mode is the select's list of options
     const node_live = collections.NodeLive(.select_options).init(self.asNode(), {}, frame);
     const options = try frame._factory.chained(.{
         node_live.htmlCollectionValue(),
@@ -339,6 +399,56 @@ pub fn getLength(self: *Select) u32 {
         i += 1;
     }
     return i;
+}
+
+pub const max_list_items = 100_000;
+pub fn setLength(self: *Select, value: u32, frame: *Frame) !void {
+    // value > options.len means add blank options
+    // value < options.len means remove extra options
+
+    // we'll collect the length AND trim at the same time
+
+    var len: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| : (len += 1) {
+        if (len >= value) {
+            // we have to be in trim mode
+            option.asElement().remove(frame);
+        }
+    }
+    if (len >= value) {
+        return;
+    }
+
+    // growing, we append blank options
+    if (value > max_list_items) {
+        lp.log.debug(.js, "select overflow", .{ .max_list_items = max_list_items, .request = value });
+        return;
+    }
+    const self_node = self.asNode();
+    const doc = self_node.ownerDocument(frame).?;
+    for (len..value) |_| {
+        // yes, one at time, for the correct mutation records
+        const blank = try Frame.node_factory.createElementNS(doc, .html, "option", null);
+        _ = try self_node.appendChild(blank, frame);
+    }
+}
+
+// remove() is ChildNode's; remove(index) removes the option at index.
+fn remove(self: *Select, index_: ?js.Value, frame: *Frame) !void {
+    const value = index_ orelse return self.asElement().remove(frame);
+    const index = try value.toI32();
+
+    if (index < 0) {
+        return;
+    }
+    var i: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| : (i += 1) {
+        if (i == index) {
+            return option.asElement().remove(frame);
+        }
+    }
 }
 
 const AddBeforeOption = union(enum) {
@@ -376,28 +486,8 @@ pub fn getSelectedOptions(self: *Select, frame: *Frame) !collections.NodeLive(.s
     return collections.NodeLive(.selected_options).init(self.asNode(), {}, frame);
 }
 
-pub fn getForm(self: *Select, frame: *Frame) ?*Form {
-    const element = self.asElement();
-
-    // If form attribute exists, ONLY use that (even if it references nothing)
-    if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
-        if (frame.getElementByIdFromNode(element.asNode(), form_id)) |form_element| {
-            return form_element.is(Form);
-        }
-        // form attribute present but invalid - no form owner
-        return null;
-    }
-
-    // No form attribute - traverse ancestors looking for a <form>
-    var node = element.asNode()._parent;
-    while (node) |n| {
-        if (n.is(Element.Html.Form)) |form| {
-            return form;
-        }
-        node = n._parent;
-    }
-
-    return null;
+pub fn getForm(self: *Select) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *Select, frame: *Frame) !js.Array {
@@ -425,14 +515,8 @@ fn getValidationMessage(self: *const Select) []const u8 {
     return "";
 }
 
-pub fn checkValidity(self: *Select, frame: *Frame) !bool {
-    if (!self.getWillValidate()) return true;
-    const v = ValidityState{ ._owner = self.asElement() };
-    if (v.getValid(frame)) return true;
-
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame._page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-    return false;
+fn checkValidity(self: *Select, frame: *Frame) !bool {
+    return ValidityState.checkValidity(self.asElement(), frame);
 }
 
 fn reportValidity(self: *Select, frame: *Frame) !bool {
@@ -451,8 +535,9 @@ pub fn hasCustomValidity(self: *const Select) bool {
     return self._custom_validity != null;
 }
 
+// Unlike an input's, a select's rule doesn't ask for a mutable element: a
+// disabled one still reports it, it's only barred from validation.
 pub fn suffersValueMissing(self: *const Select) bool {
-    if (!self.getWillValidate()) return false;
     if (!self.getRequired()) return false;
     // No selected option ⇒ no value to submit.
     const opt = self.selectedOption() orelse return true;
@@ -478,7 +563,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLSelectElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -495,12 +579,13 @@ pub const JsApi = struct {
     pub const selectedOptions = bridge.accessor(Select.getSelectedOptions, null, .{});
     pub const form = bridge.accessor(Select.getForm, null, .{});
     pub const size = reflect.unsignedLong("size", .{});
-    pub const length = bridge.accessor(Select.getLength, null, .{});
+    pub const length = bridge.accessor(Select.getLength, Select.setLength, .{ .ce_reactions = true });
     pub const labels = bridge.accessor(Select.getLabels, null, .{});
     pub const willValidate = bridge.accessor(Select.getWillValidate, null, .{});
     pub const validity = bridge.accessor(Select.getValidity, null, .{});
     pub const validationMessage = bridge.accessor(Select.getValidationMessage, null, .{});
     pub const add = bridge.function(Select.add, .{ .ce_reactions = true });
+    pub const remove = bridge.function(Select.remove, .{ .ce_reactions = true });
     pub const checkValidity = bridge.function(Select.checkValidity, .{});
     pub const reportValidity = bridge.function(Select.reportValidity, .{});
     pub const setCustomValidity = bridge.function(Select.setCustomValidity, .{});

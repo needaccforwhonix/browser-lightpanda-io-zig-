@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const Schema = @import("Schema.zig");
 const NodeRegistry = @import("../NodeRegistry.zig");
+const TelemetryOutcome = @import("../telemetry/telemetry.zig").Event.Tool.Outcome;
 
 const v8 = lp.js.v8;
 const browser_tools = lp.tools;
@@ -40,14 +41,21 @@ primitive_data: [recorded_tool_count]PrimitiveData,
 console_data: [std.enums.values(ConsoleMethod).len]ConsoleData,
 /// Notified before each `console.*` line is written. The REPL uses it to
 /// clear the live spinner so script output starts on a clean line instead
-/// of colliding with the indicator; the line still goes to stdout/stderr.
+/// of colliding with the indicator; MCP streams the line to the caller.
 console_observer: ?ConsoleObserver = null,
 /// When set, every console line writes here — stderr-bound methods included.
 console_sink: ?*std.Io.Writer = null,
+/// When set, the script's return value writes here instead of as a console
+/// line, so a caller can cap console output without losing it.
+result_sink: ?*std.Io.Writer = null,
 /// In-flight async `goto`s; emptied before each `runSource` returns.
 pending_gotos: std.ArrayList(PendingGoto),
 /// Restarted per `runSource`; backs `PendingGoto.deadline_ms`.
 run_timer: std.Io.Timestamp,
+/// Cancels a run that outlives it. Null runs without a deadline.
+timeout_ms: ?u32 = null,
+timed_out: bool = false,
+cancelled: std.atomic.Value(bool) = .init(false),
 
 /// The runtime installs exactly the recorded browser tools as script
 /// primitives — the same set the recorder writes — so every recorded call
@@ -75,6 +83,8 @@ const PendingGoto = struct {
     /// `run_timer` reading (ms) past which the navigation is abandoned.
     deadline_ms: u64,
     until: lp.Config.WaitUntil,
+    /// `datetime.milliTimestamp(.awake)` at start, for telemetry.
+    started_ms: u64,
 
     fn reset(self: *PendingGoto) void {
         v8.v8__Global__Reset(&self.resolver);
@@ -82,14 +92,14 @@ const PendingGoto = struct {
     }
 };
 
-const ConsoleMethod = enum {
+pub const ConsoleMethod = enum {
     debug,
     @"error",
     info,
     log,
     warn,
 
-    fn writesStderr(self: ConsoleMethod) bool {
+    pub fn writesStderr(self: ConsoleMethod) bool {
         return switch (self) {
             .@"error", .warn => true,
             .debug, .info, .log => false,
@@ -104,7 +114,7 @@ const ConsoleData = struct {
 
 const ConsoleObserver = struct {
     context: *anyopaque,
-    notify: *const fn (context: *anyopaque) void,
+    notify: *const fn (context: *anyopaque, method: ConsoleMethod, line: []const u8) void,
 };
 
 const InitError = error{
@@ -155,6 +165,8 @@ pub fn init(
 }
 
 pub fn deinit(self: *Runtime) void {
+    // A cancel that lands after the run returned leaves the isolate terminating.
+    self.env.cancelTerminate();
     // Free leftover Globals while the isolate is still alive (a run terminated
     // mid-flight can leave some).
     for (self.pending_gotos.items) |*pending| pending.reset();
@@ -166,12 +178,17 @@ pub fn deinit(self: *Runtime) void {
     allocator.destroy(self);
 }
 
-pub fn terminate(self: *Runtime) void {
-    self.env.terminate();
+/// Stops the run in flight, from any thread: script JS, page JS it is waiting
+/// on, and session waits (`goto`, `waitForSelector`, …).
+pub fn cancel(self: *Runtime) void {
+    self.cancelled.store(true, .release);
+    self.session.browser.env.requestTerminate();
+    self.env.requestTerminate();
 }
 
-pub fn cancelTerminate(self: *Runtime) void {
-    self.env.cancelTerminate();
+fn checkCancel(context: *anyopaque) bool {
+    const self: *Runtime = @ptrCast(@alignCast(context));
+    return self.cancelled.load(.acquire);
 }
 
 fn createContext(self: *Runtime) InitError!void {
@@ -258,7 +275,7 @@ fn setObjectProperty(
     v8.v8__Object__Set(
         object,
         context,
-        @ptrCast(self.env.isolate.initStringHandle(name)),
+        @ptrCast(self.env.isolate.initStringHandle(name) catch return error.RuntimeInitFailed),
         value,
         &out,
     );
@@ -270,6 +287,42 @@ fn setObjectProperty(
 /// runtime's call arena and valid until deinit or the next run.
 pub fn runSource(self: *Runtime, source: []const u8, name: []const u8) RunError!?[]const u8 {
     _ = self.call_arena.reset(.retain_capacity);
+    self.timed_out = false;
+
+    const previous_hook = self.session.cancel_hook;
+    self.session.cancel_hook = .{ .context = @ptrCast(self), .check = checkCancel };
+    defer self.session.cancel_hook = previous_hook;
+
+    var done: std.Io.Event = .unset;
+    const deadline = if (self.timeout_ms) |ms|
+        std.Thread.spawn(.{}, cancelAtDeadline, .{ self, &done, ms }) catch
+            return try self.dupeError("could not start the script timer")
+    else
+        null;
+    const result = self.evaluate(source, name);
+    if (deadline) |thread| {
+        done.set(lp.io);
+        thread.join();
+    }
+    if (self.cancelled.swap(false, .acq_rel)) {
+        self.env.cancelTerminate();
+        self.session.browser.env.cancelTerminate();
+    }
+    return result;
+}
+
+fn cancelAtDeadline(self: *Runtime, done: *std.Io.Event, timeout_ms: u32) void {
+    const deadline: std.Io.Clock.Timestamp = .fromNow(lp.io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+    // Spurious wakeups also report Timeout; only the deadline counts.
+    while (true) {
+        if (done.waitTimeout(lp.io, .{ .deadline = deadline })) |_| return else |_| {}
+        if (deadline.compare(.lte, .now(lp.io, .awake))) break;
+    }
+    self.timed_out = true;
+    self.cancel();
+}
+
+fn evaluate(self: *Runtime, source: []const u8, name: []const u8) RunError!?[]const u8 {
     self.run_timer = .now(lp.io, .boot);
 
     var hs: lp.js.HandleScope = undefined;
@@ -285,15 +338,17 @@ pub fn runSource(self: *Runtime, source: []const u8, name: []const u8) RunError!
     v8.v8__TryCatch__CONSTRUCT(&try_catch, self.env.isolate.handle);
     defer v8.v8__TryCatch__DESTRUCT(&try_catch);
 
-    const script_name = self.env.isolate.initStringHandle(name);
+    const script_name = self.env.isolate.initStringHandle(name) catch
+        return try self.dupeError("RangeError: Invalid string length");
     // Wrap in an async IIFE so the source can use top-level `await` (e.g.
     // `await page.goto(...)`). The wrapper evaluates to a Promise; a top-level
     // `return <expr>` becomes that Promise's value, which we echo. (A bare
     // trailing expression no longer auto-prints — `await` and a script
     // completion value are mutually exclusive in JS.)
-    const wrapped = std.fmt.allocPrint(self.call_arena.allocator(), "(async () => {{\n{s}\n}})()", .{source}) catch
+    const wrapped = self.call_arena.allocator().print("(async () => {{\n{s}\n}})()", .{source}) catch
         return try self.dupeError("out of memory");
-    const script_source = self.env.isolate.initStringHandle(wrapped);
+    const script_source = self.env.isolate.initStringHandle(wrapped) catch
+        return try self.dupeError("RangeError: Invalid string length");
 
     var origin: v8.ScriptOrigin = undefined;
     v8.v8__ScriptOrigin__CONSTRUCT(&origin, script_name);
@@ -350,7 +405,7 @@ fn formatRejection(self: *Runtime, context: *const v8.Context, reason: *const v8
 /// Error-like object — in which case the caller stringifies the value itself.
 fn errorMessage(self: *Runtime, context: *const v8.Context, reason: *const v8.Value) ?*const v8.Value {
     if (!v8.v8__Value__IsObject(reason)) return null;
-    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle("message"));
+    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle("message") catch return null);
     const message = v8.v8__Object__Get(@ptrCast(reason), context, key) orelse return null;
     return if (v8.v8__Value__IsString(message)) message else null;
 }
@@ -364,6 +419,10 @@ fn printCompletion(self: *Runtime, context: *const v8.Context, value: *const v8.
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const text = self.displayString(arena_state.allocator(), context, value) catch return;
+    if (self.result_sink) |sink| {
+        sink.print("{s}\n", .{text}) catch {};
+        return;
+    }
     self.writeConsoleLine(.log, text);
 }
 
@@ -412,9 +471,23 @@ fn construct(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
         self.installFunction(context, this, @tagName(data.tool), primitiveCallback, data) catch
             return self.throwError("failed to construct page");
     }
-    self.installFunction(context, this, "close", closeCallback, self) catch
-        return self.throwError("failed to construct page");
+    for (page_methods) |m| {
+        self.installFunction(context, this, m.name, m.callback, self) catch
+            return self.throwError("failed to construct page");
+    }
 }
+
+const PageMethod = struct {
+    name: []const u8,
+    callback: Callback,
+    /// Rendered by `zig build docs`.
+    summary: []const u8,
+};
+
+/// The page methods besides the recorded tools.
+pub const page_methods = [_]PageMethod{
+    .{ .name = "close", .callback = closeCallback, .summary = "Stales the handle, so later calls on it fail. The page itself is reclaimed on the next `goto` or at script end." },
+};
 
 /// Property carrying a page handle's claim on a live frame. Numeric while the
 /// page is navigated; absent/undefined once never-navigated or closed.
@@ -464,14 +537,12 @@ fn invoke(self: *Runtime, tool: BrowserTool, info: *const v8.FunctionCallbackInf
     };
 
     switch (result) {
-        .ok => |text| switch (tool) {
-            .extract => {
-                const normalized = self.normalizeExtractReturnJson(arena, text) catch |err| switch (err) {
-                    error.OutOfMemory => return self.throwError("out of memory"),
-                };
-                self.setReturnJson(context, info, normalized);
-            },
-            else => self.setReturnString(info, text),
+        .ok => |text| {
+            if (!tool.returnsJson()) return self.setReturnString(info, text);
+            const json = if (tool == .extract) self.normalizeExtractReturnJson(arena, text) catch |err| switch (err) {
+                error.OutOfMemory => return self.throwError("out of memory"),
+            } else text;
+            self.setReturnJson(context, info, json);
         },
         .fail => |message| self.throwError(message),
     }
@@ -501,13 +572,16 @@ fn invokeGoto(
     // startGoto is browser-side work; run it under the browser's isolate.
     // Settle the resolver only after the block: a `return` inside it runs
     // script-isolate work before the deferred exit.
-    const maybe_started: ?browser_tools.StartedGoto = blk: {
+    const started_ms = lp.datetime.milliTimestamp(.awake);
+    const maybe_started: browser_tools.ToolError!browser_tools.StartedGoto = blk: {
         self.session.browser.env.isolate.enter();
         defer self.session.browser.env.isolate.exit();
-        break :blk browser_tools.startGoto(arena, self.session, self.registry, args, receiver_frame_id) catch null;
+        break :blk browser_tools.startGoto(arena, self.session, self.registry, args, receiver_frame_id);
     };
-    const started = maybe_started orelse
+    const started = maybe_started catch |err| {
+        self.recordGoto(browser_tools.errorOutcome(err), started_ms);
         return self.rejectResolver(context, resolver, "navigation failed");
+    };
 
     var pending: PendingGoto = .{
         .frame_id = started.frame_id,
@@ -515,6 +589,7 @@ fn invokeGoto(
         .receiver = undefined,
         .deadline_ms = @as(u64, @intCast(self.run_timer.untilNow(lp.io, .boot).toMilliseconds())) + started.timeout_ms,
         .until = started.until,
+        .started_ms = started_ms,
     };
     v8.v8__Global__New(self.env.isolate.handle, resolver, &pending.resolver);
     v8.v8__Global__New(self.env.isolate.handle, this, &pending.receiver);
@@ -606,16 +681,23 @@ const Outcome = enum { loaded, failed, timed_out };
 /// Resolve or reject one pending goto's Promise and free its Globals.
 fn settlePending(self: *Runtime, context: *const v8.Context, pending: *PendingGoto, outcome: Outcome) void {
     const resolver: *const v8.PromiseResolver = @ptrCast(v8.v8__Global__Get(&pending.resolver, self.env.isolate.handle));
+    var result: TelemetryOutcome = switch (outcome) {
+        .loaded => .ok,
+        .failed => .navigation_failed,
+        .timed_out => .navigation_timeout,
+    };
     switch (outcome) {
         .loaded => done: {
             const frame = self.session.findFrameByFrameId(pending.frame_id);
             if (frame == null or frame.?._last_navigate_error != null) {
                 self.rejectResolver(context, resolver, "navigation failed");
+                result = .navigation_failed;
                 break :done;
             }
             const this: *const v8.Object = @ptrCast(v8.v8__Global__Get(&pending.receiver, self.env.isolate.handle));
             self.bindFrameId(context, this, pending.frame_id) catch {
                 self.rejectResolver(context, resolver, "internal: page bind failed");
+                result = .internal;
                 break :done;
             };
             self.resolveResolver(context, resolver, @ptrCast(this));
@@ -623,7 +705,17 @@ fn settlePending(self: *Runtime, context: *const v8.Context, pending: *PendingGo
         .failed => self.rejectResolver(context, resolver, "navigation failed"),
         .timed_out => self.rejectResolver(context, resolver, "navigation timed out"),
     }
+    self.recordGoto(result, pending.started_ms);
+    // Async gotos settle here, outside `browser_tools.call`.
+    if (self.session.tool_observer) |observer| {
+        const reported: browser_tools.ToolResult = .{ .text = @tagName(outcome), .is_error = outcome != .loaded, .navigated = true };
+        observer.onCall(observer.context, "goto", null, &reported, lp.datetime.milliTimestamp(.awake) -| pending.started_ms, self.session.findFrameByFrameId(pending.frame_id));
+    }
     pending.reset();
+}
+
+fn recordGoto(self: *Runtime, outcome: TelemetryOutcome, started_ms: u64) void {
+    self.app.telemetry.recordTool(BrowserTool.goto.telemetryId(), .script, outcome, started_ms);
 }
 
 /// Reject every still-pending goto and clear the list, freeing all Globals.
@@ -631,6 +723,7 @@ fn failAllPending(self: *Runtime, context: *const v8.Context, message: []const u
     for (self.pending_gotos.items) |*pending| {
         const resolver: *const v8.PromiseResolver = @ptrCast(v8.v8__Global__Get(&pending.resolver, self.env.isolate.handle));
         self.rejectResolver(context, resolver, message);
+        self.recordGoto(.cancelled, pending.started_ms);
         pending.reset();
     }
     self.pending_gotos.clearRetainingCapacity();
@@ -658,7 +751,7 @@ fn bindFrameId(self: *Runtime, context: *const v8.Context, this: *const v8.Objec
 /// the page was never navigated or has been closed.
 fn receiverFrameId(self: *Runtime, context: *const v8.Context, info: *const v8.FunctionCallbackInfo) ?u32 {
     const this = v8.v8__FunctionCallbackInfo__This(info) orelse return null;
-    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle(frame_id_key));
+    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle(frame_id_key) catch return null);
     const prop = v8.v8__Object__Get(this, context, key) orelse return null;
     if (!v8.v8__Value__IsNumber(prop)) return null;
     var out: v8.MaybeU32 = undefined;
@@ -688,7 +781,7 @@ fn invokeConsole(self: *Runtime, method: ConsoleMethod, info: *const v8.Function
 }
 
 fn writeConsoleLine(self: *Runtime, method: ConsoleMethod, line: []const u8) void {
-    if (self.console_observer) |obs| obs.notify(obs.context);
+    if (self.console_observer) |obs| obs.notify(obs.context, method, line);
     if (self.console_sink) |sink| {
         sink.print("{s}\n", .{line}) catch {};
         return;
@@ -714,10 +807,10 @@ fn callTool(
     self.session.browser.env.isolate.enter();
     defer self.session.browser.env.isolate.exit();
 
-    const result = browser_tools.call(arena, self.session, self.registry, @tagName(tool), args, .{}) catch |err| switch (err) {
+    const result = browser_tools.call(arena, self.session, self.registry, @tagName(tool), args, .{ .source = .script }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FrameNotLoaded => return .{ .fail = "no page loaded - run page.goto(url) first" },
-        else => return .{ .fail = std.fmt.allocPrint(arena, "{s} failed: {s}", .{ @tagName(tool), @errorName(err) }) catch return error.OutOfMemory },
+        else => return .{ .fail = arena.print("{s} failed: {s}", .{ @tagName(tool), browser_tools.errorMessage(err) }) catch return error.OutOfMemory },
     };
 
     if (result.is_error) return .{ .fail = result.text };
@@ -740,6 +833,7 @@ fn buildArgs(
     const argc: usize = @intCast(v8.v8__FunctionCallbackInfo__Length(info));
     return switch (tool) {
         .extract => try self.extractArgs(arena, context, info, argc),
+        .classify => try self.classifyArgs(arena, context, info, argc),
         else => try self.marshalArgs(arena, context, info, argc, Schema.positionalFor(tool)),
     };
 }
@@ -808,6 +902,54 @@ fn extractArgs(
     return try objectWith(arena, "schema", .{ .string = schema });
 }
 
+fn classifyArgs(
+    self: *Runtime,
+    arena: std.mem.Allocator,
+    context: *const v8.Context,
+    info: *const v8.FunctionCallbackInfo,
+    argc: usize,
+) BuildArgsError!std.json.Value {
+    if (argc < 1 or argc > 2) return error.InvalidArguments;
+    var questions = try self.argJson(arena, context, info, 0);
+    var options: ?std.json.Value = if (argc == 2) try self.argJson(arena, context, info, 1) else null;
+    if (argc == 1 and questions == .object and isClassifyWrapper(questions.object)) {
+        options = questions;
+        questions = questions.object.get("questions").?;
+    }
+
+    var args = try objectWith(arena, "questions", switch (questions) {
+        .string, .array, .object => questions,
+        else => return error.InvalidArguments,
+    });
+    switch (options orelse return args) {
+        .string => |selector| try args.object.put(arena, "selector", .{ .string = selector }),
+        .object => |opts| {
+            if (opts.get("selector")) |s| if (s == .string) try args.object.put(arena, "selector", s);
+            if (opts.get("presets")) |p| if (p == .bool) try args.object.put(arena, "presets", p);
+        },
+        else => return error.InvalidArguments,
+    }
+    return args;
+}
+
+/// `{ questions, selector?, presets? }` rather than a question set that has
+/// a question keyed `questions`: alone, a `questions` key whose value reads
+/// as one question is the question.
+fn isClassifyWrapper(obj: std.json.ObjectMap) bool {
+    const inner = obj.get("questions") orelse return false;
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, "questions") and !std.mem.eql(u8, key, "selector") and !std.mem.eql(u8, key, "presets")) return false;
+    }
+    if (obj.count() > 1) return true;
+    return switch (inner) {
+        .string => false,
+        .object => |o| o.get("question") == null,
+        else => true,
+    };
+}
+
 fn extractSchemaString(arena: std.mem.Allocator, value: std.json.Value) error{OutOfMemory}![]const u8 {
     return switch (value) {
         .string => |str| normalizeExtractSchemaString(arena, str),
@@ -822,7 +964,7 @@ fn extractSchemaString(arena: std.mem.Allocator, value: std.json.Value) error{Ou
 fn normalizeExtractSchemaString(arena: std.mem.Allocator, schema: []const u8) error{OutOfMemory}![]const u8 {
     const trimmed = std.mem.trim(u8, schema, &std.ascii.whitespace);
     if (trimmed.len == 0 or trimmed[0] != '[') return schema;
-    return try std.fmt.allocPrint(arena, "{{\"__root\":{s}}}", .{schema});
+    return try arena.print("{{\"__root\":{s}}}", .{schema});
 }
 
 fn argJson(
@@ -872,7 +1014,11 @@ fn normalizeExtractReturnJson(_: *Runtime, arena: std.mem.Allocator, value: []co
 }
 
 fn setReturnString(self: *Runtime, info: *const v8.FunctionCallbackInfo, value: []const u8) void {
-    self.setReturnValue(info, @ptrCast(self.env.isolate.initStringHandle(value)));
+    const str = self.env.isolate.initStringHandle(value) catch {
+        self.throwRangeError("Invalid string length");
+        return;
+    };
+    self.setReturnValue(info, @ptrCast(str));
 }
 
 fn setReturnJson(self: *Runtime, context: *const v8.Context, info: *const v8.FunctionCallbackInfo, value: []const u8) void {
@@ -880,7 +1026,10 @@ fn setReturnJson(self: *Runtime, context: *const v8.Context, info: *const v8.Fun
         self.setReturnValue(info, self.env.isolate.initUndefined());
         return;
     }
-    const json = self.env.isolate.initStringHandle(value);
+    const json = self.env.isolate.initStringHandle(value) catch {
+        self.throwRangeError("Invalid string length");
+        return;
+    };
     const parsed = v8.v8__JSON__Parse(context, json) orelse {
         self.throwError("extract returned invalid JSON");
         return;
@@ -896,6 +1045,10 @@ fn setReturnValue(_: *Runtime, info: *const v8.FunctionCallbackInfo, value: *con
 
 fn throwError(self: *Runtime, message: []const u8) void {
     _ = v8.v8__Isolate__ThrowException(self.env.isolate.handle, self.env.isolate.createError(message));
+}
+
+fn throwRangeError(self: *Runtime, message: []const u8) void {
+    _ = v8.v8__Isolate__ThrowException(self.env.isolate.handle, self.env.isolate.createRangeError(message));
 }
 
 fn throwTypeError(self: *Runtime, message: []const u8) void {
@@ -925,7 +1078,7 @@ fn formatCaught(
         break :blk if (n < 0) null else @as(u32, @intCast(n));
     };
     if (line) |n| {
-        return std.fmt.allocPrint(arena, "line {d}: {s}", .{ n, exception }) catch return error.OutOfMemory;
+        return arena.print("line {d}: {s}", .{ n, exception }) catch return error.OutOfMemory;
     }
     return try self.dupeError(exception);
 }
@@ -975,7 +1128,8 @@ fn stringToOwned(
         self.env.isolate.handle,
         buf.ptr,
         buf.len,
-        v8.NO_NULL_TERMINATION | v8.REPLACE_INVALID_UTF8,
+        v8.WRITE_REPLACE_INVALID_UTF8,
+        null,
     );
     return buf[0..written];
 }
@@ -985,6 +1139,7 @@ fn dupeError(self: *Runtime, message: []const u8) RunError![]const u8 {
 }
 
 const testing = @import("../testing.zig");
+const zenai = @import("zenai");
 
 fn runTestScript(runtime: *Runtime, source: []const u8) !void {
     if (try runtime.runSource(source, "agent-runtime-test.js")) |message| {
@@ -993,9 +1148,9 @@ fn runTestScript(runtime: *Runtime, source: []const u8) !void {
     }
 }
 
-fn terminateRuntimeSoon(runtime: *Runtime) void {
+fn cancelRuntimeSoon(runtime: *Runtime) void {
     lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
-    runtime.terminate();
+    runtime.cancel();
 }
 
 test "agent script runtime: goto and evaluate dispatch through browser tools" {
@@ -1016,7 +1171,81 @@ test "agent script runtime: goto and evaluate dispatch through browser tools" {
     );
 
     const frame = testing.test_session.currentFrame().?;
-    try testing.expect(std.mem.indexOf(u8, frame.url, "/src/browser/tests/mcp_actions.html") != null);
+    try testing.expect(std.mem.find(u8, frame.url, "/src/browser/tests/mcp_actions.html") != null);
+}
+
+test "agent script runtime: page.classify executes presets, categories and structured questions" {
+    defer testing.test_session.closeAllPages();
+
+    const jev = try testing.MockJev.start(testing.arena_allocator);
+    defer jev.stop();
+
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
+    defer runtime.deinit();
+
+    try runTestScript(runtime,
+        \\const page = new Page();
+        \\await page.goto("http://localhost:9582/src/browser/tests/mcp_actions.html");
+        \\
+        \\const presets = await page.classify({ isBlocked: true, isCaptcha: true });
+        \\if (typeof presets !== "object" || presets === null) throw new Error("expected presets to return an object");
+        \\if (presets.isBlocked !== 0.95) throw new Error("expected isBlocked === 0.95, got " + presets.isBlocked);
+        \\if (presets.isCaptcha !== 0.05) throw new Error("expected isCaptcha === 0.05, got " + presets.isCaptcha);
+        \\
+        \\// An empty object asks every preset; the mock answers isBlocked and isCaptcha only.
+        \\const all = await page.classify({});
+        \\if (all.isBlocked !== 0.95) throw new Error("expected all.isBlocked === 0.95, got " + all.isBlocked);
+        \\if (all.isConsentWall !== null) throw new Error("expected all.isConsentWall === null, got " + all.isConsentWall);
+        \\if (!("isEmptyCatalog" in all)) throw new Error("expected every preset key in the answer");
+        \\
+        \\const category = await page.classify(["product", "catalog"]);
+        \\if (category !== "product") throw new Error("expected category === 'product', got " + category);
+        \\
+        \\const checks = await page.classify({ is_blocked: "Is it blocked?" });
+        \\if (checks.is_blocked !== 0.95) throw new Error("expected is_blocked === 0.95, got " + checks.is_blocked);
+        \\const named = await page.classify({ questions: "Is it blocked?" });
+        \\if (!("questions" in named)) throw new Error("expected a question keyed questions, got " + JSON.stringify(named));
+        \\
+        \\const details = await page.classify({ page_type: { question: "What is it?", options: ["product", "catalog"] } });
+        \\if (details.page_type.choice !== "product") throw new Error("expected details.page_type.choice === 'product'");
+        \\if (details.page_type.confidence !== 0.9) throw new Error("expected details.page_type.confidence === 0.9");
+        \\
+        \\const both = await page.classify({ page_type: { question: "What is it?", options: ["product", "catalog"] } }, { presets: true });
+        \\if (both.page_type.choice !== "product") throw new Error("expected page_type beside the presets");
+        \\if (both.isBlocked !== 0.95) throw new Error("expected isBlocked among the presets, got " + both.isBlocked);
+        \\
+        \\const scored = await page.classify({ completeness: { question: "How complete?", levels: ["empty", "partial", "full"] } });
+        \\if (scored.completeness.level !== "full") throw new Error("expected level === 'full', got " + scored.completeness.level);
+        \\if (scored.completeness.probabilities.full !== 0.85) throw new Error("expected probabilities keyed by level label");
+    );
+}
+
+test "agent script runtime: page.classify missing API key throws" {
+    defer testing.test_session.closeAllPages();
+
+    _ = unsetenv(@constCast(zenai.typesafe.env_var_name));
+
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
+    defer runtime.deinit();
+
+    try runTestScript(runtime,
+        \\const page = new Page();
+        \\await page.goto("http://localhost:9582/src/browser/tests/mcp_actions.html");
+        \\let caught = false;
+        \\try {
+        \\  await page.classify({ isBlocked: true });
+        \\} catch (err) {
+        \\  caught = true;
+        \\  if (!err.message.includes("TYPESAFE_API_KEY")) throw new Error("unexpected error: " + err.message);
+        \\}
+        \\if (!caught) throw new Error("expected classify without API key to throw");
+    );
 }
 
 test "agent script runtime: Page must be called with new" {
@@ -1027,7 +1256,7 @@ test "agent script runtime: Page must be called with new" {
     defer runtime.deinit();
 
     const message = (try runtime.runSource("Page();", "agent-runtime-page-no-new.js")).?;
-    try testing.expect(std.mem.indexOf(u8, message, "must be called with new") != null);
+    try testing.expect(std.mem.find(u8, message, "must be called with new") != null);
 }
 
 test "agent script runtime: a method on an un-navigated page errors" {
@@ -1041,7 +1270,7 @@ test "agent script runtime: a method on an un-navigated page errors" {
         \\const page = new Page();
         \\page.extract({ btn: "#btn" });
     , "agent-runtime-not-navigated.js")).?;
-    try testing.expect(std.mem.indexOf(u8, message, "not navigated") != null);
+    try testing.expect(std.mem.find(u8, message, "not navigated") != null);
 }
 
 test "agent script runtime: page.close stales the handle" {
@@ -1061,7 +1290,7 @@ test "agent script runtime: page.close stales the handle" {
         \\page.close();
         \\page.extract({ btn: "#btn" });
     , "agent-runtime-close.js")).?;
-    try testing.expect(std.mem.indexOf(u8, message, "closed") != null);
+    try testing.expect(std.mem.find(u8, message, "closed") != null);
 }
 
 test "agent script runtime: parallel gotos coexist and route per page" {
@@ -1183,7 +1412,7 @@ test "agent script runtime: a failed navigation rejects the goto promise" {
     try runTestScript(runtime,
         \\let caught = "";
         \\try {
-        \\  await new Page().goto("http://localhost:1/", { timeout: 2000 });
+        \\  await new Page().goto("http://localhost:65534/", { timeout: 2000 });
         \\} catch (e) {
         \\  caught = String(e);
         \\}
@@ -1336,7 +1565,7 @@ test "agent script runtime: primitives re-entered from argument callbacks stay i
     try testing.expectString("value ok tail\n", sink.written());
 }
 
-test "agent script runtime: terminate interrupts local JavaScript" {
+test "agent script runtime: cancel interrupts local JavaScript" {
     defer testing.test_session.closeAllPages();
 
     var registry = NodeRegistry.init(testing.allocator);
@@ -1345,12 +1574,34 @@ test "agent script runtime: terminate interrupts local JavaScript" {
     const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
     defer runtime.deinit();
 
-    const thread = try std.Thread.spawn(.{}, terminateRuntimeSoon, .{runtime});
-    defer runtime.cancelTerminate();
-    defer thread.join();
+    // After an `await` the loop runs inside a microtask checkpoint.
+    for ([_][]const u8{ "while (true) {}", "await null;\nwhile (true) {}" }) |source| {
+        const thread = try std.Thread.spawn(.{}, cancelRuntimeSoon, .{runtime});
+        defer thread.join();
+        try testing.expect(try runtime.runSource(source, "agent-runtime-cancel-test.js") != null);
+    }
 
-    const message = try runtime.runSource("while (true) {}", "agent-runtime-terminate-test.js");
-    try testing.expect(message != null);
+    var returned: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    runtime.result_sink = &returned.writer;
+    try testing.expectEqual(null, try runtime.runSource("return 'ok';", "agent-runtime-cancel-test.js"));
+    try testing.expectString("ok\n", returned.written());
+}
+
+test "agent script runtime: timeout_ms cancels a run that outlives it" {
+    defer testing.test_session.closeAllPages();
+
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
+    defer runtime.deinit();
+
+    runtime.timeout_ms = 50;
+    try testing.expect(try runtime.runSource("while (true) {}", "agent-runtime-timeout-test.js") != null);
+    try testing.expect(runtime.timed_out);
+
+    try testing.expectEqual(null, try runtime.runSource("void 0;", "agent-runtime-timeout-test.js"));
+    try testing.expect(!runtime.timed_out);
 }
 
 test "agent script runtime: agent variables persist and page globals are isolated" {
@@ -1432,9 +1683,9 @@ test "agent script runtime: tool errors throw and stop execution" {
         \\globalThis.marker = "after";
     , "agent-runtime-failure.js")).?;
 
-    try testing.expect(std.mem.indexOf(u8, message, "click") != null or
-        std.mem.indexOf(u8, message, "NodeNotFound") != null or
-        std.mem.indexOf(u8, message, "#does-not-exist") != null);
+    try testing.expect(std.mem.find(u8, message, "click") != null or
+        std.mem.find(u8, message, "NodeNotFound") != null or
+        std.mem.find(u8, message, "#does-not-exist") != null);
 
     try runTestScript(runtime,
         \\if (globalThis.marker !== "before") throw new Error("script continued after tool failure");
@@ -1468,10 +1719,15 @@ test "agent script runtime: mousedown focus follows mouse-focusability rules" {
         \\  add('span', 'dynChild', {}, add('div', 'dynFocus', { tabindex: '0' })).textContent = 'x';
         \\  add('div', 'dynNeg', { tabindex: '-1' }).textContent = 'neg';
         \\  add('div', 'dynBad', { tabindex: 'abc' }).textContent = 'bad';
-        \\  add('button', 'dynBadBtn', { tabindex: 'abc' }).addEventListener('mouseup', () => { window.badBtnFocusAtMouseup = document.activeElement.id; });
-        \\  add('div', 'toolbarBtn').addEventListener('mousedown', (e) => e.preventDefault());
+        \\  add('button', 'dynBadBtn', { tabindex: 'abc' });
+        \\  add('button', 'toolbarBtn').addEventListener('mousedown', (e) => e.preventDefault());
+        \\  add('input', 'dynLabInp');
+        \\  add('label', 'dynLabel', { for: 'dynLabInp' }).textContent = 'lab';
         \\  add('span', 'dynHostSpan', {}, add('div', 'dynHost', { contenteditable: 'true' })).textContent = 'hs';
         \\  add('span', 'dynInnerSpan', {}, add('div', 'dynInner', { contenteditable: 'true' }, add('div', 'dynOuter', { contenteditable: 'true' }))).textContent = 'is';
+        \\  add('span', 'dynGapSpan', {}, add('p', 'dynGapInner', { contenteditable: 'true' }, add('section', 'dynGapMid', {}, add('div', 'dynGapOuter', { contenteditable: 'true' })))).textContent = 'gs';
+        \\  add('span', 'dynIslandSpan', {}, add('p', 'dynIsland', { contenteditable: 'false', tabindex: '0' }, add('div', 'dynIslandHost', { contenteditable: 'true' }))).textContent = 'ls';
+        \\  add('span', 'dynReentrySpan', {}, add('b', 'dynReentry', { contenteditable: 'true' }, add('p', 'dynReentryOff', { contenteditable: 'false' }, add('div', 'dynReentryHost', { contenteditable: 'true' })))).textContent = 'rs';
         \\  const SVG = 'http://www.w3.org/2000/svg';
         \\  add('rect', 'dynSvgRect', { tabindex: '0', width: '100', height: '40' }, add('svg', 'dynSvg', {}, document.body, SVG), SVG);
         \\`);
@@ -1482,19 +1738,26 @@ test "agent script runtime: mousedown focus follows mouse-focusability rules" {
         \\page.click("#dynBad");
         \\expectActive("body", "unparsable tabindex was mouse-focusable");
         \\page.click("#dynBadBtn");
-        \\// Sampled at mouseup: click activation focuses a button regardless of
-        \\// what mousedown decided, which would mask the native focusability.
-        \\if (page.evaluate("window.badBtnFocusAtMouseup") !== "dynBadBtn") throw new Error("unparsable tabindex on a native button lost native mousedown focusability");
+        \\expectActive("dynBadBtn", "unparsable tabindex on a native button lost native mousedown focusability");
         \\// Toolbar idiom: preventDefault() on mousedown preserves existing focus.
         \\page.click("#inp");
         \\expectActive("inp", "setup failed");
         \\page.click("#toolbarBtn");
         \\expectActive("inp", "preventDefault on mousedown did not protect focus");
+        \\// Label click focuses its labeled control.
+        \\page.click("#dynLabel");
+        \\expectActive("dynLabInp", "clicking label did not focus its control");
         \\// Verified against Chrome.
         \\page.click("#dynHostSpan");
         \\expectActive("dynHost", "span inside contenteditable did not focus host");
         \\page.click("#dynInnerSpan");
         \\expectActive("dynOuter", "nested contenteditable did not focus the outer host");
+        \\page.click("#dynGapSpan");
+        \\expectActive("dynGapOuter", "an ancestor without contenteditable split the editable region");
+        \\page.click("#dynIslandSpan");
+        \\expectActive("dynIsland", "contenteditable=false island did not take its own focus");
+        \\page.click("#dynReentrySpan");
+        \\expectActive("dynReentry", "contenteditable inside a false island did not focus its own host");
         \\// An explicit tabindex is focusable on a non-HTML element too.
         \\page.click("#inp");
         \\page.click("#dynSvgRect");
@@ -1546,7 +1809,7 @@ test "agent script runtime: builtin argument marshalling (positional + options)"
         const message = (try runtime.runSource(
             \\await new Page().goto("http://localhost:9582/src/browser/tests/mcp_actions.html", { url: "http://other" });
         , "agent-runtime-conflict.js")).?;
-        try testing.expect(std.mem.indexOf(u8, message, "invalid arguments") != null);
+        try testing.expect(std.mem.find(u8, message, "invalid arguments") != null);
     }
 
     // More positionals than the tool has fields throws.
@@ -1556,7 +1819,7 @@ test "agent script runtime: builtin argument marshalling (positional + options)"
             \\await page.goto("http://localhost:9582/src/browser/tests/mcp_actions.html");
             \\page.click("#btn", "#extra");
         , "agent-runtime-arity.js")).?;
-        try testing.expect(std.mem.indexOf(u8, message, "invalid arguments") != null);
+        try testing.expect(std.mem.find(u8, message, "invalid arguments") != null);
     }
 }
 

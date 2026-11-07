@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const js = @import("../js/js.zig");
 
 const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
@@ -100,20 +101,20 @@ pub fn registerMutationObserver(frame: *Frame, observer: *MutationObserver) !voi
 }
 
 pub fn unregisterMutationObserver(frame: *Frame, observer: *MutationObserver) void {
-    observer.releaseRef(frame._page);
+    observer.releaseRef(frame.page);
     frame._mutation.observers.remove(&observer.node);
 }
 
 pub fn registerIntersectionObserver(frame: *Frame, observer: *IntersectionObserver) !void {
     observer.acquireRef();
-    try frame._intersection.observers.append(frame.arena, observer);
+    try frame._intersection.observers.append(frame.page_arena, observer);
 }
 
 pub fn unregisterIntersectionObserver(frame: *Frame, observer: *IntersectionObserver) void {
     for (frame._intersection.observers.items, 0..) |obs, i| {
         if (obs == observer) {
-            observer.releaseRef(frame._page);
-            _ = frame._intersection.observers.swapRemove(i);
+            observer.releaseRef(frame.page);
+            _ = frame._intersection.observers.orderedRemove(i);
             return;
         }
     }
@@ -121,14 +122,14 @@ pub fn unregisterIntersectionObserver(frame: *Frame, observer: *IntersectionObse
 
 pub fn registerResizeObserver(frame: *Frame, observer: *ResizeObserver) !void {
     observer.acquireRef();
-    try frame._resize.observers.append(frame.arena, observer);
+    try frame._resize.observers.append(frame.page_arena, observer);
 }
 
 pub fn unregisterResizeObserver(frame: *Frame, observer: *ResizeObserver) void {
     for (frame._resize.observers.items, 0..) |obs, i| {
         if (obs == observer) {
-            observer.releaseRef(frame._page);
-            _ = frame._resize.observers.swapRemove(i);
+            observer.releaseRef(frame.page);
+            _ = frame._resize.observers.orderedRemove(i);
             return;
         }
     }
@@ -171,7 +172,7 @@ pub fn scheduleIntersectionChecks(frame: *Frame) void {
     frame._intersection.check_scheduled = true;
     frame.js.queueIntersectionChecks() catch |err| {
         frame._intersection.check_scheduled = false;
-        log.err(.frame, "frame.scheduleIntersectionChecks", .{ .err = err, .type = frame._type, .url = frame.url });
+        log.err(.frame, "scheduleIntersectionChecks", .{ .err = err, .type = frame._type, .url = frame.url });
     };
 }
 
@@ -257,7 +258,7 @@ fn resizeAttributeChanged(frame: *Frame, element: *Element, name: String) void {
     }
 
     for (frame._resize.observers.items) |observer| {
-        if (observer.observesWithin(element)) {
+        if (observer.observesWithin(element, frame)) {
             scheduleResizeDelivery(frame);
             return;
         }
@@ -277,21 +278,32 @@ pub fn deliverResizes(frame: *Frame) void {
         frame._resize.delivery_depth = 0;
     };
     if (frame._resize.delivery_depth > 16) {
-        log.warn(.frame, "frame.ResizeLimit", .{ .type = frame._type, .url = frame.url });
+        log.debug(.frame, "frame.ResizeLimit", .{ .type = frame._type, .url = frame.url });
         frame._resize.delivery_depth = 0;
         return;
     }
 
-    // Iterate backwards so an observer disconnecting during its callback is safe.
-    var i = frame._resize.observers.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (i >= frame._resize.observers.items.len) {
-            continue;
-        }
-        const observer = frame._resize.observers.items[i];
+    // snapshot and acquireRef because a the callback for observer A could
+    // disconnect, which would then wipe our reference from under us.
+    const observers = frame.call_arena.dupe(*ResizeObserver, frame._resize.observers.items) catch |err| {
+        log.err(.frame, "deliverResizes.snapshot", .{ .err = err, .type = frame._type, .url = frame.url });
+        return;
+    };
+
+    for (observers) |observer| {
+        observer.acquireRef();
+    }
+    defer for (observers) |observer| {
+        observer.releaseRef(frame.page);
+    };
+
+    const attribution = frame.js.attribution;
+    const task_scope = attribution.enterNew(.observer, .{ .label = "ResizeObserver" });
+    defer task_scope.exit();
+
+    for (observers) |observer| {
         observer.deliverEntries(frame) catch |err| {
-            log.err(.frame, "frame.deliverResizes", .{ .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.frame, "frame.deliverResizes", .{ .err = err, .type = frame._type, .url = frame.url });
             if (err == error.ExecutionTerminated) {
                 return;
             }
@@ -338,12 +350,12 @@ fn disconnectRunawayIntersectionObservers(frame: *Frame) void {
     // only the crossing itself is logged.
     if (!frame._intersection.runaway) {
         frame._intersection.runaway = true;
-        log.err(.frame, "frame.IntersectionRunaway", .{ .type = frame._type, .url = frame.url });
+        log.debug(.frame, "frame.IntersectionRunaway", .{ .type = frame._type, .url = frame.url });
     }
 
     for (frame._intersection.observers.items) |observer| {
-        observer.reset(frame._page);
-        observer.releaseRef(frame._page);
+        observer.reset(frame.page);
+        observer.releaseRef(frame.page);
     }
     frame._intersection.observers.clearRetainingCapacity();
 }
@@ -369,16 +381,29 @@ pub fn deliverIntersections(frame: *Frame) void {
         return;
     }
 
-    // Iterate backwards so an observer disconnecting during its callback is safe.
-    var i = frame._intersection.observers.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (i >= frame._intersection.observers.items.len) {
-            continue;
-        }
-        const observer = frame._intersection.observers.items[i];
+    // snapshot and acquireRef because a the callback for observer A could
+    // disconnect, which would then wipe our reference from under us.
+    const observers = frame.call_arena.dupe(*IntersectionObserver, frame._intersection.observers.items) catch |err| {
+        log.err(.frame, "deliverIntersections.snapshot", .{ .err = err, .type = frame._type, .url = frame.url });
+        return;
+    };
+    for (observers) |observer| {
+        observer.acquireRef();
+    }
+    defer for (observers) |observer| {
+        observer.releaseRef(frame.page);
+    };
+
+    const attribution = frame.js.attribution;
+    const task_scope = attribution.enterNew(.observer, .{
+        .label = "IntersectionObserver",
+        .cut = true, // This is the cause of many endless loops
+    });
+    defer task_scope.exit();
+
+    for (observers) |observer| {
         observer.deliverEntries(frame) catch |err| {
-            log.err(.frame, "frame.deliverIntersections", .{ .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.frame, "frame.deliverIntersections", .{ .err = err, .type = frame._type, .url = frame.url });
             if (err == error.ExecutionTerminated) {
                 return;
             }
@@ -388,7 +413,7 @@ pub fn deliverIntersections(frame: *Frame) void {
 
 // No observer on the frame can make progress once this path is reached.
 fn disconnectRunawayMutationObservers(frame: *Frame) void {
-    log.err(.frame, "frame.MutationRunaway", .{ .type = frame._type, .url = frame.url });
+    log.debug(.frame, "frame.MutationRunaway", .{ .type = frame._type, .url = frame.url });
 
     var node: ?*std.DoublyLinkedList.Node = frame._mutation.observers.first;
     while (node) |n| {
@@ -423,7 +448,7 @@ pub fn deliverMutations(frame: *Frame) void {
     };
 
     if (frame._mutation.delivery_depth > 16) {
-        log.err(.frame, "frame.MutationLimit", .{ .type = frame._type, .url = frame.url });
+        log.debug(.frame, "frame.MutationLimit", .{ .type = frame._type, .url = frame.url });
         frame._mutation.delivery_depth = 0;
         capped = true;
         return;
@@ -442,6 +467,9 @@ pub fn deliverMutations(frame: *Frame) void {
     // we started the delivery. So we need to snapshot this. Any observers which
     // get records during this phase will only be processed on the next microtask tick.
     var notify: std.ArrayList(*MutationObserver) = .empty;
+    defer for (notify.items) |observer| {
+        observer.releaseRef(frame.page);
+    };
     var it: ?*std.DoublyLinkedList.Node = frame._mutation.observers.first;
     while (it) |node| : (it = node.next) {
         const observer: *MutationObserver = @fieldParentPtr("node", node);
@@ -452,11 +480,12 @@ pub fn deliverMutations(frame: *Frame) void {
             log.err(.frame, "deliverMutations.notify", .{ .err = err, .type = frame._type, .url = frame.url });
             break;
         };
+        observer.acquireRef();
     }
 
     for (notify.items) |observer| {
         observer.deliverRecords(frame) catch |err| {
-            log.err(.frame, "frame.deliverMutations", .{ .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.frame, "frame.deliverMutations", .{ .err = err, .type = frame._type, .url = frame.url });
             if (err == error.ExecutionTerminated) {
                 return;
             }
@@ -465,13 +494,13 @@ pub fn deliverMutations(frame: *Frame) void {
 
     // slotchange events fire after the observer callbacks (spec step order)
     for (slots) |slot| {
-        const event = Event.initTrusted(comptime .wrap("slotchange"), .{ .bubbles = true }, frame._page) catch |err| {
+        const event = Event.initTrusted(comptime .wrap("slotchange"), .{ .bubbles = true }, frame.page) catch |err| {
             log.err(.frame, "deliverSlotchange.init", .{ .err = err, .type = frame._type, .url = frame.url });
             continue;
         };
         const target = slot.asNode().asEventTarget();
         frame._event_manager.dispatch(target, event) catch |err| {
-            log.err(.frame, "deliverSlotchange.dispatch", .{ .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.frame, "deliverSlotchange.dispatch", .{ .err = err, .type = frame._type, .url = frame.url });
             if (err == error.ExecutionTerminated) {
                 return;
             }

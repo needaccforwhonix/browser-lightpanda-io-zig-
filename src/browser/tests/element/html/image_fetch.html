@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<meta name=lp-mode content=test>
 <script src="../../testing.js"></script>
 <body></body>
 
@@ -9,7 +10,7 @@
   complete successfully — that's what makes these a test of the fetch path
   and not just of the event plumbing.
 
-  /images/ok.png is over the headers-only drain threshold (abort branch),
+  /images/ok.png is over the partial drain threshold (abort branch),
   /images/small.png is under it (drain branch).
 -->
 
@@ -26,6 +27,12 @@
   state.resolve();
   await state.done(() => {
     testing.expectEqual("load", evt);
+    testing.expectEqual(1000, img.naturalWidth);
+    testing.expectEqual(750, img.naturalHeight);
+    // Natural size does not set HTML attributes, but an image that isn't
+    // rendered reports it as its width.
+    testing.expectEqual(null, img.getAttribute('width'));
+    testing.expectEqual(1000, img.width);
   });
 </script>
 
@@ -44,6 +51,7 @@
   state.resolve();
   await state.done(() => {
     testing.expectEqual("error", evt);
+    testing.expectEqual(0, img.naturalWidth);
   });
 </script>
 
@@ -63,8 +71,9 @@
   state.resolve();
   await state.done(() => {
     testing.expectEqual("load", evt);
-    // Drained, not decoded: still no dimensions.
-    testing.expectEqual(0, img.naturalWidth);
+    // The body is not decoded, but its header gives the natural size.
+    testing.expectEqual(320, img.naturalWidth);
+    testing.expectEqual(240, img.naturalHeight);
   });
 </script>
 
@@ -103,6 +112,9 @@
   state.resolve();
   await state.done(() => {
     testing.expectEqual("load", evt);
+    testing.diverges('Lightpanda does not parse SVG for a natural size', () => {
+      testing.expectEqual(0, img.naturalWidth);
+    });
   });
 </script>
 
@@ -137,17 +149,58 @@
   state.resolve();
   await state.done(() => {
     testing.expectEqual("load", evt);
+    testing.expectEqual(1000, img.naturalWidth);
+    testing.expectEqual(750, img.naturalHeight);
+  });
+</script>
+
+<script id="img-jpeg-and-src-change" type=module>
+  const state = await testing.async();
+  const img = new Image();
+  const loaded = new Promise(resolve => img.addEventListener('load', resolve, { once: true }));
+  img.src = '/images/photo.jpg';
+  await loaded;
+  testing.expectEqual(1000, img.naturalWidth);
+  testing.expectEqual(750, img.naturalHeight);
+
+  const failed = new Promise(resolve => img.addEventListener('error', resolve, { once: true }));
+  // a distinct URL: a browser may fail a cached 404 synchronously
+  img.src = '/images/404.png?jpeg';
+  testing.expectEqual(1000, img.naturalWidth); // The old image stands until the new one settles.
+  await failed;
+
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(0, img.naturalWidth);
+    testing.expectEqual(0, img.naturalHeight);
+  });
+</script>
+
+<script id="img-removing-loaded-src-clears-dimensions" type=module>
+  const state = await testing.async();
+  const img = new Image();
+  const loaded = new Promise(resolve => img.addEventListener('load', resolve, { once: true }));
+  img.src = '/images/small.png';
+  await loaded;
+  testing.expectEqual(320, img.naturalWidth);
+  img.removeAttribute('src');
+
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual(0, img.naturalWidth);
+    testing.expectEqual(0, img.naturalHeight);
   });
 </script>
 
 <script id="img-complete-tracks-the-fetch" type=module>
-  // complete is false only while a request is in flight. naturalWidth stays
-  // 0 either way: we fetch images, we don't decode them.
+  // complete is false while a request is in flight. Dimensions are only
+  // available after the header has arrived; no bitmap is decoded.
   const state = await testing.async();
   const img = document.createElement("img");
 
   testing.expectEqual(true, img.complete);
-  img.src = "/images/ok.png";
+  // a distinct URL: a browser completes a cached image synchronously
+  img.src = "/images/ok.png?complete";
   const during = img.complete;
 
   await new Promise(resolve => {
@@ -160,8 +213,8 @@
   await state.done(() => {
     testing.expectEqual(false, during);
     testing.expectEqual(true, after);
-    testing.expectEqual(0, img.naturalWidth);
-    testing.expectEqual(0, img.naturalHeight);
+    testing.expectEqual(1000, img.naturalWidth);
+    testing.expectEqual(750, img.naturalHeight);
   });
 </script>
 
@@ -181,8 +234,8 @@
   });
 </script>
 
-<script id="img-empty-src-does-nothing" type=module>
-  // No src, no request, no event — in any mode.
+<script id="img-empty-src-fires-error" type=module>
+  // An empty src selects nothing, which is an error, but makes no request.
   const state = await testing.async();
   const img = document.createElement("img");
   let fired = null;
@@ -195,7 +248,8 @@
 
   state.resolve();
   await state.done(() => {
-    testing.expectEqual(null, fired);
+    testing.expectEqual("error", fired);
+    testing.expectEqual(true, img.complete);
   });
 </script>
 
@@ -212,13 +266,16 @@
   img.src = "/images/404.png";
   img.src = "/images/ok.png";
 
-  await new Promise(resolve => setTimeout(resolve, 300));
+  await new Promise(resolve => img.addEventListener("load", resolve, { once: true }));
+  // Leave room for a stray report from the superseded fetch.
+  await new Promise(resolve => setTimeout(resolve, 50));
 
   state.resolve();
   await state.done(() => {
     // The superseded 404 is dropped; only the winning fetch reports.
     testing.expectEqual(1, events.length);
     testing.expectEqual("load", events[0]);
+    testing.expectEqual(1000, img.naturalWidth);
   });
 </script>
 
@@ -235,7 +292,7 @@
   img.src = "/images/ok.png";
   img.removeAttribute("src");
 
-  await new Promise(resolve => setTimeout(resolve, 300));
+  await new Promise(resolve => setTimeout(resolve, 50));
 
   state.resolve();
   await state.done(() => {
@@ -253,6 +310,37 @@
   div.innerHTML = '<img src="/images/404.png">';
   const img = div.querySelector('img');
   // No fetch was issued, so it never entered the in-flight state.
-  testing.expectEqual(true, img.complete);
+  testing.diverges('browsers fetch the images of a fragment parse', () => {
+    testing.expectEqual(true, img.complete);
+  });
 }
+</script>
+
+<script id="img-srcset-fetches" type=module>
+  // A srcset-only image fetches its candidate, and a <picture> source wins
+  // over the img's own src.
+  const state = await testing.async();
+  const img = document.createElement("img");
+  const srcset = await new Promise(resolve => {
+    img.addEventListener("load", () => resolve("load"));
+    img.addEventListener("error", () => resolve("error"));
+    img.srcset = "/images/small.png 1x";
+  });
+
+  const picture = document.createElement("picture");
+  const source = document.createElement("source");
+  const picture_img = document.createElement("img");
+  picture_img.src = "/images/small.png";
+  picture.append(source, picture_img);
+  const from_source = await new Promise(resolve => {
+    picture_img.addEventListener("load", () => resolve("load"));
+    picture_img.addEventListener("error", () => resolve("error"));
+    source.srcset = "/images/404.png";
+  });
+
+  state.resolve();
+  await state.done(() => {
+    testing.expectEqual("load", srcset);
+    testing.expectEqual("error", from_source);
+  });
 </script>

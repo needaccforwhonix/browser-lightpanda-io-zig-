@@ -63,8 +63,13 @@ _owner_node: std.DoublyLinkedList.Node = .{},
 _send_queue: std.ArrayList(Message) = .empty,
 _send_offset: usize = 0,
 
-// buffered incoming frame
+// incoming data message, accumulated across its fragments
 _recv_buffer: std.ArrayList(u8) = .empty,
+_recv_fragmented: bool = false,
+// incoming control frame, kept apart since one can arrive between the
+// fragments of a data message (RFC 6455 §5.4)
+_control_buffer: [125]u8 = undefined,
+_control_len: usize = 0,
 
 // Incoming events, buffered and delivered by HttpClient's dispatcher. We never
 // run JS inside a libcurl callback. Too many things can go wrong.
@@ -95,11 +100,10 @@ _close_reason: []const u8 = "",
 // negotiated protocol
 _protocol: []const u8 = "",
 
-// Event handlers
-_on_open: ?js.Function.Global = null,
-_on_message: ?js.Function.Global = null,
-_on_error: ?js.Function.Global = null,
-_on_close: ?js.Function.Global = null,
+/// Subprotocols offered by the client at construction (RFC 6455 §4.1).
+_subprotocols: []const u8 = "",
+
+_task: js.Attribution.Tag,
 
 const ReadyState = enum(u8) {
     connecting = 0,
@@ -136,15 +140,38 @@ const BinaryType = enum {
     arraybuffer,
 };
 
-pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*WebSocket {
+// WebIDL: `optional (DOMString or sequence<DOMString>) protocols = []`
+const Protocols = union(enum) {
+    list: []const []const u8,
+    one: []const u8,
+};
+
+pub fn init(url: []const u8, protocols_: ?Protocols, exec: *const Execution) !*WebSocket {
+    var one: [1][]const u8 = undefined;
+    const protocols: []const []const u8 = if (protocols_) |p| switch (p) {
+        .list => |list| list,
+        .one => |protocol| blk: {
+            one[0] = protocol;
+            break :blk &one;
+        },
+    } else &.{};
+
     {
-        if (std.mem.indexOfScalar(u8, url, '#') != null) {
+        if (std.mem.findScalar(u8, url, '#') != null) {
             // Fragments are not allowed in WebSocket URLs.
             return error.SyntaxError;
         }
-        for (protocols) |protocol| {
+        for (protocols, 0..) |protocol, i| {
             if (!isValidProtocol(protocol)) {
                 return error.SyntaxError;
+            }
+            // The WebSocket constructor rejects a list where a value occurs
+            // more than once, so `new WebSocket(url, ['a', 'a'])` throws
+            // instead of sending a duplicated Sec-WebSocket-Protocol entry.
+            for (protocols[0..i]) |seen| {
+                if (std.mem.eql(u8, seen, protocol)) {
+                    return error.SyntaxError;
+                }
             }
         }
     }
@@ -167,10 +194,10 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
 
         // yup, this is what we're supposed to do.
         if (std.mem.eql(u8, scheme, "http:")) {
-            break :blk try std.fmt.allocPrintSentinel(arena.allocator(), "ws{s}", .{resolved["http".len..]}, 0);
+            break :blk try arena.allocator().printSentinel("ws{s}", .{resolved["http".len..]}, 0);
         }
         if (std.mem.eql(u8, scheme, "https:")) {
-            break :blk try std.fmt.allocPrintSentinel(arena.allocator(), "wss{s}", .{resolved["https".len..]}, 0);
+            break :blk try arena.allocator().printSentinel("wss{s}", .{resolved["https".len..]}, 0);
         }
 
         return error.SyntaxError;
@@ -185,6 +212,10 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
         ._proto = undefined,
         ._url = resolved_url,
         ._http_client = http_client,
+        ._task = exec.js.attribution.begin(.request, .{
+            .label = resolved_url,
+            .detail = "WebSocket",
+        }),
     });
 
     // This ensures that if we fail to connect, we have at least 1 event slot
@@ -213,14 +244,14 @@ pub fn init(url: []const u8, protocols: [][]const u8, exec: *const Execution) !*
     return self;
 }
 
-fn connect(self: *WebSocket, protocols: [][]const u8) !void {
+fn connect(self: *WebSocket, protocols: []const []const u8) !void {
     const exec = self._exec;
     const arena = self._arena;
     const resolved_url = self._url;
     const http_client = self._http_client;
 
-    if (isBlockedPort(resolved_url)) {
-        return error.BlockedPort;
+    if (http.isBadPortUrl(resolved_url)) {
+        return error.UnsafePort;
     }
 
     const conn = http_client.network.newConnection() orelse {
@@ -231,6 +262,9 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
 
     try conn.setURL(resolved_url);
     try conn.setConnectOnly(false);
+    // receivedHeaderCallback reads the first status line as the upgrade's,
+    // so a proxy's CONNECT response must not reach it.
+    try conn.setSuppressConnectHeaders();
 
     try conn.setReadCallback(sendDataCallback, true);
     try conn.setWriteCallback(receivedDataCallback);
@@ -241,7 +275,9 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
         try conn.addHeader(allocator, hdr.name, hdr.value);
     }
     if (protocols.len > 0) {
-        try conn.addHeader(allocator, "Sec-WebSocket-Protocol", try std.mem.join(allocator, ", ", protocols));
+        const subprotocols = try std.mem.join(allocator, ", ", protocols);
+        self._subprotocols = subprotocols;
+        try conn.addHeader(allocator, "Sec-WebSocket-Protocol", subprotocols);
     }
 
     {
@@ -258,7 +294,7 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
         var buf: std.Io.Writer.Allocating = .init(allocator);
         try exec.session.cookie_jar.forRequest(resolved_url, &buf.writer, .{
             .is_http = true,
-            .is_navigation = false,
+            .kind = .subresource,
             .origin_url = exec.siteForCookies(),
         });
         if (buf.written().len > 0) {
@@ -276,30 +312,8 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
     self._conn = conn;
 }
 
-fn isBlockedPort(url: [:0]const u8) bool {
-    const port = URL.getPort(url);
-    if (port.len == 0) {
-        // the default port for ws/wss is never blocked
-        return false;
-    }
-    return http.isBadPort(std.fmt.parseInt(u16, port, 10) catch return false);
-}
-
 pub fn deinit(self: *WebSocket, page: *Page) void {
     self.releaseTransport();
-
-    if (self._on_open) |func| {
-        func.release();
-    }
-    if (self._on_message) |func| {
-        func.release();
-    }
-    if (self._on_error) |func| {
-        func.release();
-    }
-    if (self._on_close) |func| {
-        func.release();
-    }
 
     for (self._send_queue.items) |msg| {
         msg.deinit(page);
@@ -309,6 +323,7 @@ pub fn deinit(self: *WebSocket, page: *Page) void {
         arena.release();
     }
 
+    page.removeTarget(self.asEventTarget());
     self._arena.release();
 }
 
@@ -320,7 +335,7 @@ pub fn acquireRef(self: *WebSocket) void {
     self._rc.acquire();
 }
 
-fn asEventTarget(self: *WebSocket) *EventTarget {
+pub fn asEventTarget(self: *WebSocket) *EventTarget {
     return self._proto;
 }
 
@@ -339,7 +354,7 @@ pub fn kill(self: *WebSocket) void {
 pub fn transportClosed(self: *WebSocket, err: ?anyerror) void {
     self.releaseTransport();
     self.bufferEvent(.{ .disconnected = err }) catch |err2| {
-        log.err(.websocket, "close failure", .{ .err = err2 });
+        log.debug(.websocket, "close failure", .{ .err = err2 });
         // Can't buffer. Drop the socket without running JS.
         self.kill();
     };
@@ -355,6 +370,9 @@ pub fn deliverEvents(self: *WebSocket) void {
     // alive even when a terminal event releases the base reference.
     defer self.releaseRef(self._exec.page);
 
+    const page_scope = self._exec.page.logScope();
+    defer page_scope.exit();
+
     self._delivering = true;
     defer self._delivering = false;
 
@@ -364,11 +382,19 @@ pub fn deliverEvents(self: *WebSocket) void {
             // a terminal event or a re-entrant kill got us; drop the rest
             break;
         }
-        switch (self._events.items[i]) {
+        const event = self._events.items[i];
+        const task_scope = self._exec.js.attribution.enterNew(.message, .{
+            .parent = self._task,
+            .label = "WebSocket",
+            .detail = @tagName(event),
+            .cut = event != .open,
+        });
+        defer task_scope.exit();
+        switch (event) {
             .open => {
                 self._ready_state = .open;
                 self.dispatchOpenEvent() catch |err| {
-                    log.err(.websocket, "open event fail", .{ .err = err });
+                    log.debug(.websocket, "open event fail", .{ .err = err });
                 };
             },
             .message => |msg| {
@@ -376,14 +402,14 @@ pub fn deliverEvents(self: *WebSocket) void {
                 // events after that
                 if (self._ready_state == .open) {
                     self.dispatchMessageEvent(msg.data, msg.frame_type) catch |err| {
-                        log.err(.websocket, "message event dispatch failed", .{ .err = err });
+                        log.debug(.websocket, "message event dispatch failed", .{ .err = err });
                     };
                 }
             },
             .close_frame => self.handleCloseFrame(),
             .local_close => {
                 self.dispatchCloseEvent(self._close_code, self._close_reason, false) catch |err| {
-                    log.err(.websocket, "close event dispatch failed", .{ .err = err });
+                    log.debug(.websocket, "close event dispatch failed", .{ .err = err });
                 };
                 self.deactivate();
             },
@@ -407,7 +433,7 @@ fn handleCloseFrame(self: *WebSocket) void {
     // (.disconnected follows).
     self._ready_state = .closing;
     self.queueMessage(.close) catch |err| {
-        log.err(.websocket, "reciprocal close", .{ .err = err, .url = self._url });
+        log.debug(.websocket, "reciprocal close", .{ .err = err, .url = self._url });
     };
 }
 
@@ -416,7 +442,7 @@ fn disconnected(self: *WebSocket, err_: ?anyerror) void {
     self._ready_state = .closed;
 
     if (err_) |err| {
-        log.warn(.websocket, "disconnected", .{ .err = err, .url = self._url });
+        log.debug(.websocket, "disconnected", .{ .err = err, .url = self._url });
     } else {
         log.info(.websocket, "disconnected", .{ .url = self._url, .reason = "closed" });
     }
@@ -430,12 +456,12 @@ fn disconnected(self: *WebSocket, err_: ?anyerror) void {
     // Spec requires error event before close on abnormal closure.
     if (!was_clean) {
         self.dispatchErrorEvent() catch |err| {
-            log.err(.websocket, "error event dispatch failed", .{ .err = err });
+            log.debug(.websocket, "error event dispatch failed", .{ .err = err });
         };
     }
 
     self.dispatchCloseEvent(code, reason, was_clean) catch |err| {
-        log.err(.websocket, "close event dispatch failed", .{ .err = err });
+        log.debug(.websocket, "close event dispatch failed", .{ .err = err });
     };
 }
 
@@ -552,31 +578,6 @@ const SendData = union(enum) {
     js_val: js.Value,
 };
 
-/// Union for extracting bytes from ArrayBuffer/TypedArray
-const BinaryData = union(enum) {
-    int8: []i8,
-    uint8: []u8,
-    int16: []i16,
-    uint16: []u16,
-    int32: []i32,
-    uint32: []u32,
-    int64: []i64,
-    uint64: []u64,
-    float16: []f16,
-    float32: []f32,
-    float64: []f64,
-
-    fn asBuffer(self: BinaryData) []u8 {
-        return switch (self) {
-            .int8 => |b| @as([*]u8, @ptrCast(b.ptr))[0..b.len],
-            .uint8 => |b| b,
-            inline .int16, .uint16, .float16 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 2],
-            inline .int32, .uint32, .float32 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 4],
-            inline .int64, .uint64, .float64 => |b| @as([*]u8, @ptrCast(b.ptr))[0 .. b.len * 8],
-        };
-    }
-};
-
 pub fn send(self: *WebSocket, data: SendData) !void {
     if (self._ready_state != .open) {
         return error.InvalidStateError;
@@ -592,7 +593,9 @@ pub fn send(self: *WebSocket, data: SendData) !void {
             } });
         },
         .js_val => |js_val| {
-            if (js_val.isString()) |str| {
+            if (js_val.isArrayBuffer() == false and js_val.isArrayBufferView() == false) {
+                // Anything that isn't a buffer is sent as its string, as in Chrome
+                const str = try js_val.toString();
                 const arena = try self._exec.getArena(str.len(), "WebSocket.message");
                 errdefer arena.release();
                 try self.queueMessage(.{ .text = .{
@@ -600,8 +603,7 @@ pub fn send(self: *WebSocket, data: SendData) !void {
                     .data = try str.toSliceWithAlloc(arena.allocator()),
                 } });
             } else {
-                const binary = try js_val.toZig(BinaryData);
-                const buffer = binary.asBuffer();
+                const buffer = (try js_val.toZig(js.BufferSource)).bytes();
 
                 const arena = try self._exec.getArena(buffer.len, "WebSocket.message");
                 errdefer arena.release();
@@ -656,7 +658,7 @@ pub fn getUrl(self: *const WebSocket) []const u8 {
 }
 
 fn getReadyState(self: *const WebSocket) u16 {
-    return @intFromEnum(self._ready_state);
+    return @backingInt(self._ready_state);
 }
 
 fn getBufferedAmount(self: *const WebSocket) u32 {
@@ -684,65 +686,13 @@ fn setBinaryType(self: *WebSocket, value: []const u8) void {
     }
 }
 
-fn getOnOpen(self: *const WebSocket) ?js.Function.Global {
-    return self._on_open;
-}
-
-fn setOnOpen(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_open) |old| old.release();
-    if (cb_) |cb| {
-        self._on_open = try cb.persistWithThis(self);
-    } else {
-        self._on_open = null;
-    }
-}
-
-fn getOnMessage(self: *const WebSocket) ?js.Function.Global {
-    return self._on_message;
-}
-
-fn setOnMessage(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_message) |old| old.release();
-    if (cb_) |cb| {
-        self._on_message = try cb.persistWithThis(self);
-    } else {
-        self._on_message = null;
-    }
-}
-
-fn getOnError(self: *const WebSocket) ?js.Function.Global {
-    return self._on_error;
-}
-
-fn setOnError(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_error) |old| old.release();
-    if (cb_) |cb| {
-        self._on_error = try cb.persistWithThis(self);
-    } else {
-        self._on_error = null;
-    }
-}
-
-fn getOnClose(self: *const WebSocket) ?js.Function.Global {
-    return self._on_close;
-}
-
-fn setOnClose(self: *WebSocket, cb_: ?js.Function) !void {
-    if (self._on_close) |old| old.release();
-    if (cb_) |cb| {
-        self._on_close = try cb.persistWithThis(self);
-    } else {
-        self._on_close = null;
-    }
-}
-
 fn dispatchOpenEvent(self: *WebSocket) !void {
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "open", self._on_open)) {
+    if (exec.hasDirectListeners(target, "open")) {
         const event = try Event.initTrusted(comptime .wrap("open"), .{}, exec.page);
-        try exec.dispatch(target, event, self._on_open, .{ .context = "WebSocket open" });
+        try exec.dispatch(target, event, .{ .context = "WebSocket open" });
     }
 }
 
@@ -750,7 +700,7 @@ fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsF
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "message", self._on_message)) {
+    if (exec.hasDirectListeners(target, "message")) {
         const msg_data: MessageEvent.Data = if (frame_type == .binary)
             switch (self._binary_type) {
                 .arraybuffer => .{ .arraybuffer = .{ .values = data } },
@@ -767,7 +717,7 @@ fn dispatchMessageEvent(self: *WebSocket, data: []const u8, frame_type: http.WsF
             .data = msg_data,
             .origin = "",
         }, exec.page);
-        try exec.dispatch(target, event.asEvent(), self._on_message, .{ .context = "WebSocket message" });
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket message" });
     }
 }
 
@@ -775,9 +725,9 @@ fn dispatchErrorEvent(self: *WebSocket) !void {
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "error", self._on_error)) {
+    if (exec.hasDirectListeners(target, "error")) {
         const event = try Event.initTrusted(comptime .wrap("error"), .{}, exec.page);
-        try exec.dispatch(target, event, self._on_error, .{ .context = "WebSocket error" });
+        try exec.dispatch(target, event, .{ .context = "WebSocket error" });
     }
 }
 
@@ -785,13 +735,13 @@ fn dispatchCloseEvent(self: *WebSocket, code: u16, reason: []const u8, was_clean
     const exec = self._exec;
     const target = self.asEventTarget();
 
-    if (exec.hasDirectListeners(target, "close", self._on_close)) {
+    if (exec.hasDirectListeners(target, "close")) {
         const event = try CloseEvent.initTrusted(comptime .wrap("close"), .{
             .code = code,
             .reason = reason,
             .wasClean = was_clean,
         }, exec.page);
-        try exec.dispatch(target, event.asEvent(), self._on_close, .{ .context = "WebSocket close" });
+        try exec.dispatch(target, event.asEvent(), .{ .context = "WebSocket close" });
     }
 }
 
@@ -801,7 +751,7 @@ fn sendDataCallback(buffer: [*]u8, buf_count: usize, buf_len: usize, data: *anyo
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
     return _sendDataCallback(conn, buffer[0..buf_len]) catch |err| {
-        log.warn(.websocket, "send callback", .{ .err = err });
+        log.debug(.websocket, "send callback", .{ .err = err });
         return http.readfunc_pause;
     };
 }
@@ -887,7 +837,7 @@ fn receivedDataCallback(buffer: [*]const u8, buf_count: usize, buf_len: usize, d
     }
     const conn: *http.Connection = @ptrCast(@alignCast(data));
     _receivedDataCallback(conn, buffer[0..buf_len]) catch |err| {
-        log.warn(.websocket, "receive callback", .{ .err = err });
+        log.debug(.websocket, "receive callback", .{ .err = err });
         // TODO: are there errors, like an invalid frame, that we shouldn't treat
         // as an error?
         return http.writefunc_error;
@@ -903,48 +853,76 @@ fn _receivedDataCallback(conn: *http.Connection, data: []const u8) !void {
         return error.NoFrameMeta;
     };
 
-    if (meta.offset == 0) {
-        if (comptime lp.IS_DEBUG) {
-            log.debug(.websocket, "incoming message", .{ .url = self._url, .len = meta.len, .bytes_left = meta.bytes_left, .type = meta.frame_type });
+    if (comptime lp.IS_DEBUG) {
+        if (meta.offset == 0) {
+            log.debug(.websocket, "incoming frame", .{ .url = self._url, .len = meta.len, .bytes_left = meta.bytes_left, .type = meta.frame_type, .fin = meta.fin });
         }
-        // Start of new frame. Pre-allocate buffer
-        self._recv_buffer.clearRetainingCapacity();
-        if (meta.len > self._http_client.max_response_size) {
+    }
+
+    switch (meta.frame_type) {
+        .text, .binary, .cont => try self.receivedData(meta, data),
+        .close, .ping, .pong => try self.receivedControl(meta, data),
+    }
+}
+
+fn receivedData(self: *WebSocket, meta: http.WsFrameMeta, data: []const u8) !void {
+    if (meta.offset == 0) {
+        if (!self._recv_fragmented) {
+            self._recv_buffer.clearRetainingCapacity();
+        }
+        const message_len = std.math.add(usize, self._recv_buffer.items.len, meta.len) catch return error.MessageTooLarge;
+        if (message_len > self._http_client.max_response_size) {
             return error.MessageTooLarge;
         }
-        try self._recv_buffer.ensureTotalCapacityPrecise(self._arena.allocator(), meta.len);
+        try self._recv_buffer.ensureUnusedCapacity(self._arena.allocator(), meta.len);
     }
 
     try self._recv_buffer.appendSlice(self._arena.allocator(), data);
 
     if (meta.bytes_left > 0) {
-        // still more data waiting for this frame
+        return;
+    }
+    if (!meta.fin) {
+        self._recv_fragmented = true;
+        return;
+    }
+    self._recv_fragmented = false;
+
+    // libcurl repeats the message type on every fragment.
+    try self.bufferMessage(self._recv_buffer.items, meta.frame_type);
+}
+
+fn receivedControl(self: *WebSocket, meta: http.WsFrameMeta, data: []const u8) !void {
+    if (meta.offset == 0) {
+        self._control_len = 0;
+    }
+    if (data.len > self._control_buffer.len - self._control_len) {
+        return error.ControlFrameTooLarge;
+    }
+    @memcpy(self._control_buffer[self._control_len..][0..data.len], data);
+    self._control_len += data.len;
+
+    if (meta.bytes_left > 0 or meta.frame_type != .close) {
         return;
     }
 
-    const message = self._recv_buffer.items;
-    switch (meta.frame_type) {
-        .text, .binary => try self.bufferMessage(message, meta.frame_type),
-        .close => {
-            // Parse close frame: 2-byte code (big-endian) + optional reason
-            const received_code = if (message.len >= 2)
-                @as(u16, message[0]) << 8 | message[1]
-            else
-                1005; // No status code received
+    const message = self._control_buffer[0..self._control_len];
+    // Parse close frame: 2-byte code (big-endian) + optional reason
+    const received_code = if (message.len >= 2)
+        @as(u16, message[0]) << 8 | message[1]
+    else
+        1005; // No status code received
 
-            if (self._ready_state != .closing) {
-                // Server-initiated: stash for the close event. (When we
-                // initiated, _close_code/_close_reason hold what close()
-                // sent, and handleCloseFrame completes the handshake.)
-                self._close_code = received_code;
-                if (message.len > 2) {
-                    self._close_reason = try self._arena.dupe(u8, message[2..]);
-                }
-            }
-            try self.bufferEvent(.close_frame);
-        },
-        .ping, .pong, .cont => {},
+    if (self._ready_state != .closing) {
+        // Server-initiated: stash for the close event. (When we
+        // initiated, _close_code/_close_reason hold what close()
+        // sent, and handleCloseFrame completes the handshake.)
+        self._close_code = received_code;
+        if (message.len > 2) {
+            self._close_reason = try self._arena.dupe(u8, message[2..]);
+        }
     }
+    try self.bufferEvent(.close_frame);
 }
 
 // libcurl has no mechanism to signal that the connection is established. The
@@ -958,7 +936,7 @@ fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usi
     const header = buffer[0..buf_len];
 
     if (self._got_101 == false and std.mem.startsWith(u8, header, "HTTP/")) {
-        if (std.mem.indexOf(u8, header, " 101 ")) |_| {
+        if (std.mem.find(u8, header, " 101 ")) |_| {
             self._got_101 = true;
         }
         return buf_len;
@@ -970,6 +948,12 @@ fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usi
             return 0;
         }
 
+        // When the client offered subprotocols, the server has to pick one of them.
+        if (self._subprotocols.len != 0 and self._protocol.len == 0) {
+            log.warn(.websocket, "no subprotocol in response", .{});
+            return 0;
+        }
+
         log.info(.websocket, "connected", .{ .url = self._url });
 
         // readyState flips to .open and onopen fires at delivery
@@ -977,7 +961,7 @@ fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usi
         return buf_len;
     }
 
-    const colon = std.mem.indexOfScalarPos(u8, header, 0, ':') orelse {
+    const colon = std.mem.findScalarPos(u8, header, 0, ':') orelse {
         // weird, continue...
         return buf_len;
     };
@@ -990,7 +974,27 @@ fn receivedHeaderCallback(buffer: [*]const u8, header_count: usize, buf_len: usi
             self._got_upgrade = true;
         }
     } else if (std.ascii.eqlIgnoreCase(header_name, "sec-websocket-protocol")) {
-        // TODO, we should validate this against our sent list.
+        // RFC 6455 §4.1 / WHATWG WebSocket: The server's selected protocol must
+        // match one of the subprotocols offered by the client, and the server
+        // MUST NOT send multiple subprotocol headers or select an unrequested
+        // protocol.
+        if (self._protocol.len != 0) {
+            log.warn(.websocket, "duplicate SecWebSocketProtocol", .{ .protocol = value });
+            self._protocol = "";
+            return 0;
+        }
+        var matched = false;
+        var it = std.mem.tokenizeSequence(u8, self._subprotocols, ", ");
+        while (it.next()) |subprotocol| {
+            if (std.mem.eql(u8, subprotocol, value)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            log.warn(.websocket, "picked unrequested subprotocol", .{ .protocol = value });
+            return 0;
+        }
         self._protocol = self._arena.dupe(u8, value) catch |err| {
             log.err(.websocket, "dupe protocol", .{ .err = err });
             return 0;
@@ -1022,16 +1026,15 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "WebSocket";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const constructor = bridge.constructor(WebSocket.init, .{});
 
-    pub const CONNECTING = bridge.property(@intFromEnum(ReadyState.connecting), .{ .template = true });
-    pub const OPEN = bridge.property(@intFromEnum(ReadyState.open), .{ .template = true });
-    pub const CLOSING = bridge.property(@intFromEnum(ReadyState.closing), .{ .template = true });
-    pub const CLOSED = bridge.property(@intFromEnum(ReadyState.closed), .{ .template = true });
+    pub const CONNECTING = bridge.property(@backingInt(ReadyState.connecting), .{ .template = true });
+    pub const OPEN = bridge.property(@backingInt(ReadyState.open), .{ .template = true });
+    pub const CLOSING = bridge.property(@backingInt(ReadyState.closing), .{ .template = true });
+    pub const CLOSED = bridge.property(@backingInt(ReadyState.closed), .{ .template = true });
 
     pub const url = bridge.accessor(WebSocket.getUrl, null, .{});
     pub const readyState = bridge.accessor(WebSocket.getReadyState, null, .{});
@@ -1041,10 +1044,10 @@ pub const JsApi = struct {
     pub const protocol = bridge.accessor(WebSocket.getProtocol, null, .{});
     pub const extensions = bridge.property("", .{ .template = false });
 
-    pub const onopen = bridge.accessor(WebSocket.getOnOpen, WebSocket.setOnOpen, .{});
-    pub const onmessage = bridge.accessor(WebSocket.getOnMessage, WebSocket.setOnMessage, .{});
-    pub const onerror = bridge.accessor(WebSocket.getOnError, WebSocket.setOnError, .{});
-    pub const onclose = bridge.accessor(WebSocket.getOnClose, WebSocket.setOnClose, .{});
+    pub const onopen = EventTarget.handlerAccessor(WebSocket, "open");
+    pub const onmessage = EventTarget.handlerAccessor(WebSocket, "message");
+    pub const onerror = EventTarget.handlerAccessor(WebSocket, "error");
+    pub const onclose = EventTarget.handlerAccessor(WebSocket, "close");
 
     pub const send = bridge.function(WebSocket.send, .{});
     pub const close = bridge.function(WebSocket.close, .{});
@@ -1052,7 +1055,7 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: WebSocket" {
-    testing.expectLog(&.{.websocket});
+    testing.expectLog(&.{ .websocket, .websocket, .websocket, .websocket, .websocket });
     try testing.htmlRunner("net/websocket.html", .{});
 }
 
@@ -1071,8 +1074,7 @@ test "WebApi: WebSocket send owns its message arena once when the unpause fails"
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    var protocols: [0][]const u8 = .{};
-    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", &protocols, &frame.js.execution);
+    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", null, &frame.js.execution);
     try testing.expect(ws._conn != null);
 
     // connect() tracked the easy handle but no tick has performed it, so

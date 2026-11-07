@@ -24,11 +24,13 @@ const posix = std.posix;
 
 const TestWSServer = @This();
 
+port: u16,
 shutdown: std.atomic.Value(bool),
 listener: ?posix.socket_t,
 
-pub fn init() TestWSServer {
+pub fn init(port: u16) TestWSServer {
     return .{
+        .port = port,
         .shutdown = .init(true),
         .listener = null,
     };
@@ -54,12 +56,14 @@ fn runImpl(self: *TestWSServer, wg: *lp.WaitGroup) !void {
     const socket = try sys_net.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     errdefer _ = std.c.close(socket);
 
-    const addr: sys_net.IpAddress = .{ .ip4 = .loopback(9584) };
+    const addr: sys_net.IpAddress = .{ .ip4 = .loopback(self.port) };
 
     try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     const sa = sys_net.sockaddrFromAddress(&addr);
     try sys_net.bind(socket, sa.ptr(), sa.len);
     try sys_net.listen(socket, 8);
+
+    self.port = (try sys_net.boundAddress(socket)).getPort();
 
     self.listener = socket;
     self.shutdown.store(false, .release);
@@ -98,9 +102,9 @@ fn handleClient(client: posix.socket_t) void {
 
     // Find Sec-WebSocket-Key
     const key_header = "Sec-WebSocket-Key: ";
-    const key_start = std.mem.indexOf(u8, request, key_header) orelse return;
+    const key_start = std.mem.find(u8, request, key_header) orelse return;
     const key_line_start = key_start + key_header.len;
-    const key_end = std.mem.indexOfScalarPos(u8, request, key_line_start, '\r') orelse return;
+    const key_end = std.mem.findScalarPos(u8, request, key_line_start, '\r') orelse return;
     const key = request[key_line_start..key_end];
 
     // Capture the request's Cookie header value (if any) so the test
@@ -111,9 +115,9 @@ fn handleClient(client: posix.socket_t) void {
     var cookie_buf: [4096]u8 = undefined;
     var cookie_len: usize = 0;
     const cookie_header = "Cookie: ";
-    if (std.mem.indexOf(u8, request, cookie_header)) |cookie_start| {
+    if (std.mem.find(u8, request, cookie_header)) |cookie_start| {
         const value_start = cookie_start + cookie_header.len;
-        const value_end = std.mem.indexOfScalarPos(u8, request, value_start, '\r') orelse value_start;
+        const value_end = std.mem.findScalarPos(u8, request, value_start, '\r') orelse value_start;
         const value = request[value_start..value_end];
         cookie_len = @min(value.len, cookie_buf.len);
         @memcpy(cookie_buf[0..cookie_len], value[0..cookie_len]);
@@ -125,9 +129,9 @@ fn handleClient(client: posix.socket_t) void {
     var origin_buf: [1024]u8 = undefined;
     var origin_len: usize = 0;
     const origin_header = "\r\nOrigin: ";
-    if (std.mem.indexOf(u8, request, origin_header)) |origin_start| {
+    if (std.mem.find(u8, request, origin_header)) |origin_start| {
         const value_start = origin_start + origin_header.len;
-        const value_end = std.mem.indexOfScalarPos(u8, request, value_start, '\r') orelse value_start;
+        const value_end = std.mem.findScalarPos(u8, request, value_start, '\r') orelse value_start;
         const value = request[value_start..value_end];
         origin_len = @min(value.len, origin_buf.len);
         @memcpy(origin_buf[0..origin_len], value[0..origin_len]);
@@ -143,12 +147,32 @@ fn handleClient(client: posix.socket_t) void {
     var accept_key: [28]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&accept_key, &hash);
 
-    // Send upgrade response
-    var resp_buf: [256]u8 = undefined;
-    const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept_key}) catch return;
+    // Send upgrade response. A test can pin the subprotocol the server
+    // selects with `?protocol=<name>`, or force a second, duplicate
+    // Sec-WebSocket-Protocol header with `?multiple-protocols`.
+    var resp_buf: [512]u8 = undefined;
+    var resp: []const u8 = undefined;
+    if (std.mem.find(u8, request, "?multiple-protocols") != null) {
+        resp = std.mem.print(&resp_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "Sec-WebSocket-Protocol: proto1\r\n" ++
+            "Sec-WebSocket-Protocol: proto2\r\n\r\n", .{accept_key}) catch return;
+    } else if (std.mem.find(u8, request, "?protocol=")) |query_start| {
+        const remaining = request[query_start + "?protocol=".len ..];
+        const val_end = std.mem.findAny(u8, remaining, " \r\n&") orelse remaining.len;
+        resp = std.mem.print(&resp_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "Sec-WebSocket-Protocol: {s}\r\n\r\n", .{ accept_key, remaining[0..val_end] }) catch return;
+    } else {
+        resp = std.mem.print(&resp_buf, "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept_key}) catch return;
+    }
     _ = sys_net.write(client, resp) catch return;
 
     // Message loop with larger buffer for big messages
@@ -301,10 +325,23 @@ fn handleTextMessage(client: posix.socket_t, payload: []const u8, cookie_header:
         return;
     }
 
+    // Command: send-fragmented - send messages split across continuation
+    // frames, one write per frame, with a ping between two fragments
+    if (std.mem.eql(u8, payload, "send-fragmented")) {
+        try sendRawFrame(client, 0x02, &.{ 1, 2 });
+        try sendRawFrame(client, 0x80, &.{3});
+        try sendRawFrame(client, 0x01, "ab");
+        try sendRawFrame(client, 0x89, "p");
+        try sendRawFrame(client, 0x00, "c");
+        try sendRawFrame(client, 0x80, "d");
+        try sendRawFrame(client, 0x81, "end");
+        return;
+    }
+
     // Command: close:CODE:REASON - send close frame with specific code/reason
     if (std.mem.startsWith(u8, payload, "close:")) {
         const rest = payload["close:".len..];
-        if (std.mem.indexOf(u8, rest, ":")) |sep| {
+        if (std.mem.find(u8, rest, ":")) |sep| {
             const code = std.fmt.parseInt(u16, rest[0..sep], 10) catch 1000;
             const reason = rest[sep + 1 ..];
             try sendCloseFrame(client, code, reason);
@@ -359,6 +396,13 @@ fn sendFrame(client: posix.socket_t, opcode: u8, prefix: []const u8, payload: []
     if (payload.len > 0) {
         _ = try sys_net.write(client, payload);
     }
+}
+
+/// Sends a frame whose first byte (FIN bit + opcode) is given as-is.
+fn sendRawFrame(client: posix.socket_t, first_byte: u8, payload: []const u8) !void {
+    std.debug.assert(payload.len <= 125);
+    _ = try sys_net.write(client, &.{ first_byte, @intCast(payload.len) });
+    _ = try sys_net.write(client, payload);
 }
 
 fn sendLargeMessage(client: posix.socket_t, size: usize) !void {

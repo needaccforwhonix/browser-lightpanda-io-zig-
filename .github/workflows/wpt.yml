@@ -15,6 +15,9 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   wpt-build-release:
     name: zig build -Dwpt_extensions release
@@ -29,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: ./.github/actions/install
@@ -37,7 +41,7 @@ jobs:
           arch: ${{env.ARCH}}
 
       - name: zig build release
-        run: zig build -Dwpt_extensions -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=generic
+        run: zig build -Dwpt_extensions -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=fast -Dcpu=generic
 
       - name: upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -56,6 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
 
@@ -84,6 +89,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           ref: fork
           repository: 'lightpanda-io/wpt'
           fetch-depth: 0
@@ -132,6 +138,11 @@ jobs:
   perf-fmt:
     name: perf-fmt
     needs: run-wpt
+    # The perf-fmt image is private to the organisation, so pulling it
+    # with GITHUB_TOKEN needs packages read on this job.
+    permissions:
+      contents: read
+      packages: read
 
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -160,6 +171,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          persist-credentials: false
           repository: 'lightpanda-io/demo'
           fetch-depth: 0
 

@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 
+const EventTarget = @import("EventTarget.zig");
 const Frame = @import("../Frame.zig");
 const Transfer = @import("../../network/HttpClient.zig").Transfer;
 
@@ -46,18 +47,10 @@ _type: Worker.WorkerType,
 // until registered; deinit/close use it to unregister.
 _registry_key: []const u8 = "",
 
-// used by HttpClient when generating notification
-// Ultimately used by CDP to generate request/loader ids.
-_frame_id: u32,
-_loader_id: u32,
-
 _closed: bool = false,
 _script_loaded: bool = false,
 _script_arena: ?*lp.Arena = null,
-_script_buffer: std.ArrayList(u8) = .empty,
 _http_transfer: ?*Transfer = null,
-
-_on_connect: ?js.Function.Global = null,
 
 // Ports pending connnection, created before the initial script finished
 _pending_connects: std.ArrayList(*MessagePort) = .empty,
@@ -68,7 +61,7 @@ pub fn init(frame: *Frame, url: [:0]const u8, name: []const u8, worker_type: Wor
     const arena = try session.getArena(.small, "SharedWorker");
     errdefer arena.release();
 
-    const owned_url = try arena.dupeZ(u8, url);
+    const owned_url = try arena.dupeSentinel(u8, url, 0);
     const frame_id = session.nextFrameId();
     const loader_id = session.nextLoaderId();
     const self = try WorkerGlobalScope.init(
@@ -81,8 +74,6 @@ pub fn init(frame: *Frame, url: [:0]const u8, name: []const u8, worker_type: Wor
             ._url = owned_url,
             ._name = try arena.dupe(u8, name),
             ._type = worker_type,
-            ._frame_id = frame_id,
-            ._loader_id = loader_id,
         },
         worker_type == .module,
         frame_id,
@@ -93,11 +84,11 @@ pub fn init(frame: *Frame, url: [:0]const u8, name: []const u8, worker_type: Wor
     errdefer proto.deinit();
 
     if (session.load_resources.worker == false) {
-        log.warnDisabledWorker();
+        frame.page.status.noteSkipped(.worker);
         return self;
     }
 
-    self._script_arena = try session.getArena(.large, "SharedWorker.script");
+    self._script_arena = try session.getArena(.small, "SharedWorker.script");
     errdefer self.releaseScriptArena();
 
     const transfer = proto.newRequest(.{
@@ -109,12 +100,11 @@ pub fn init(frame: *Frame, url: [:0]const u8, name: []const u8, worker_type: Wor
         .credentials_mode = .same_origin,
         .request_mode = .same_origin,
         .header_callback = httpHeaderCallback,
-        .data_callback = httpDataCallback,
         .done_callback = httpDoneCallback,
         .error_callback = httpErrorCallback,
         .shutdown_callback = httpShutdownCallback,
     }) catch |err| {
-        log.err(.browser, "SharedWorker request", .{ .url = owned_url, .err = err });
+        log.debug(.browser, "SharedWorker request", .{ .url = owned_url, .err = err });
         return err;
     };
 
@@ -124,7 +114,7 @@ pub fn init(frame: *Frame, url: [:0]const u8, name: []const u8, worker_type: Wor
     self._http_transfer = transfer;
 
     transfer.submit() catch |err| {
-        log.err(.browser, "SharedWorker request", .{ .url = owned_url, .err = err });
+        log.debug(.browser, "SharedWorker request", .{ .url = owned_url, .err = err });
         return err;
     };
     return self;
@@ -189,43 +179,29 @@ pub fn close(self: *SharedWorkerGlobalScope) void {
     self._closed = true;
 }
 
-fn getOnConnect(self: *const SharedWorkerGlobalScope) ?js.Function.Global {
-    return self._on_connect;
-}
-
-fn setOnConnect(self: *SharedWorkerGlobalScope, setter: ?WorkerGlobalScope.FunctionSetter) void {
-    self._on_connect = WorkerGlobalScope.getFunctionFromSetter(setter);
-}
-
 fn httpHeaderCallback(transfer: *Transfer) !Transfer.HeaderResult {
     const self: *SharedWorkerGlobalScope = @ptrCast(@alignCast(transfer.req.ctx));
 
     const status = transfer.responseStatus() orelse return .abort;
     if (status < 200 or status >= 300) {
-        log.warn(.browser, "SharedWorker status", .{
+        log.debug(.browser, "SharedWorker status", .{
             .url = self._url,
             .status = status,
         });
         return .abort;
     }
 
-    try self._script_buffer.ensureTotalCapacityPrecise(self._script_arena.?.allocator(), transfer.bodyLen());
-
     return .proceed;
 }
 
-fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
+fn httpDoneCallback(transfer: *Transfer) !void {
     const self: *SharedWorkerGlobalScope = @ptrCast(@alignCast(transfer.req.ctx));
-    try self._script_buffer.appendSlice(self._script_arena.?.allocator(), data);
-}
-
-fn httpDoneCallback(ctx: *anyopaque) !void {
-    const self: *SharedWorkerGlobalScope = @ptrCast(@alignCast(ctx));
     self._http_transfer = null;
     defer self.releaseScriptArena();
 
     const url = self._url;
-    const script = self._script_buffer.items;
+    // Evaluated synchronously, so borrowing the transfer's body is fine.
+    const script = transfer.responseBody();
 
     if (comptime lp.IS_DEBUG) {
         log.info(.browser, "shared worker fetch done", .{
@@ -251,7 +227,7 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     // TransferCanceled is teardown cancelling a still-inflight script fetch,
     // not a load failure.
     if (err != error.TransferCanceled) {
-        log.err(.browser, "shared worker fetch error", .{
+        log.debug(.browser, "shared worker fetch error", .{
             .url = self._url,
             .err = err,
         });
@@ -296,17 +272,17 @@ fn loadInitialScript(self: *SharedWorkerGlobalScope, script: []const u8) !void {
 
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
-            log.err(.browser, "shared worker script error", .{ .url = self._url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = self._url, .caught = caught });
             return;
         },
-        .module => js_context.module(false, &ls.local, script, self._url, true) catch |err| {
+        .module => js_context.module(false, &ls.local, script, self._url, .{}, true, null) catch |err| {
             if (js_context.env.terminatePending()) {
                 return;
             }
 
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
-            log.err(.browser, "shared worker module error", .{ .url = self._url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = self._url, .caught = caught });
             return;
         },
     }
@@ -319,14 +295,13 @@ fn loadInitialScript(self: *SharedWorkerGlobalScope, script: []const u8) !void {
 fn releaseScriptArena(self: *SharedWorkerGlobalScope) void {
     const arena = self._script_arena orelse return;
     self._script_arena = null;
-    self._script_buffer = .empty;
     arena.release();
 }
 
 fn drainPendingConnects(self: *SharedWorkerGlobalScope) void {
     for (self._pending_connects.items) |port| {
         self.scheduleConnect(port) catch |err| {
-            log.warn(.browser, "shared worker drain connect failed", .{ .err = err });
+            log.debug(.browser, "shared worker drain failed", .{ .err = err });
         };
     }
     self._pending_connects.clearRetainingCapacity();
@@ -374,8 +349,7 @@ const ConnectCallback = struct {
         const wgs = worker_scope._proto;
         const target = wgs.asEventTarget();
 
-        const on_connect = worker_scope._on_connect;
-        if (!wgs._event_manager.hasDirectListeners(target, "connect", on_connect)) {
+        if (!wgs._event_manager.hasDirectListeners(target, "connect")) {
             return null;
         }
 
@@ -387,23 +361,26 @@ const ConnectCallback = struct {
             .ports = &.{self.port},
             .bubbles = false,
             .cancelable = false,
-        }, wgs._page)).asEvent();
+        }, wgs.page)).asEvent();
 
-        try wgs.dispatch(target, event, on_connect, .{ .context = "SharedWorkerGlobalScope.connect" });
+        try wgs.dispatch(target, event, .{ .context = "shared worker connect" });
         return null;
     }
 };
+
+pub fn asEventTarget(self: *SharedWorkerGlobalScope) *EventTarget {
+    return self._proto.asEventTarget();
+}
 
 pub const JsApi = struct {
     pub const bridge = js.Bridge(SharedWorkerGlobalScope);
 
     pub const Meta = struct {
         pub const name = "SharedWorkerGlobalScope";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const name = bridge.accessor(SharedWorkerGlobalScope.getName, null, .{});
     pub const close = bridge.function(SharedWorkerGlobalScope.close, .{});
-    pub const onconnect = bridge.accessor(SharedWorkerGlobalScope.getOnConnect, SharedWorkerGlobalScope.setOnConnect, .{});
+    pub const onconnect = EventTarget.handlerAccessor(SharedWorkerGlobalScope, "connect");
 };

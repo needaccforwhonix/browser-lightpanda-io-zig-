@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const js = @import("../js/js.zig");
+const Page = @import("../Page.zig");
 
 const DOMException = @This();
 
@@ -65,6 +66,7 @@ pub fn fromError(err: anyerror) ?DOMException {
         error.VersionError => .{ ._code = .version_error },
         error.TransactionInactiveError => .{ ._code = .transaction_inactive_error },
         error.ReadOnlyError => .{ ._code = .read_only_error },
+        error.NotAllowedError => .{ ._code = .not_allowed_error },
         else => null,
     };
 }
@@ -72,8 +74,8 @@ pub fn fromError(err: anyerror) ?DOMException {
 fn getCode(self: *const DOMException) u8 {
     return switch (self._code) {
         // no legacy numeric code
-        .operation_error, .data_error, .constraint_error, .version_error, .transaction_inactive_error, .read_only_error => 0,
-        else => @intFromEnum(self._code),
+        .operation_error, .data_error, .constraint_error, .version_error, .transaction_inactive_error, .read_only_error, .not_allowed_error => 0,
+        else => @backingInt(self._code),
     };
 }
 
@@ -112,6 +114,7 @@ pub fn getName(self: *const DOMException) []const u8 {
         .version_error => "VersionError",
         .transaction_inactive_error => "TransactionInactiveError",
         .read_only_error => "ReadOnlyError",
+        .not_allowed_error => "NotAllowedError",
     };
 }
 
@@ -149,6 +152,7 @@ fn getMessage(self: *const DOMException) []const u8 {
         .version_error => "An attempt was made to open a database using a lower version than the existing version",
         .transaction_inactive_error => "A request was placed against a transaction which is currently not active, or which is finished",
         .read_only_error => "A mutation operation was attempted in a read-only transaction",
+        .not_allowed_error => "The request is not allowed in the current context",
     };
 }
 
@@ -162,7 +166,20 @@ pub fn toString(self: *const DOMException, exec: *js.Execution) ![]const u8 {
             else => break :blk self.getMessage(),
         }
     };
-    return std.fmt.bufPrint(exec.buf, "{s}: {s}", .{ self.getName(), msg }) catch return msg;
+    return exec.local_arena.print("{s}: {s}", .{ self.getName(), msg });
+}
+
+pub fn structuredSerialize(self: *const DOMException, writer: *js.StructuredWriter) !void {
+    writer.writeBytes(self.getName());
+    writer.writeBytes(self.getMessage());
+}
+
+pub fn structuredDeserialize(reader: *js.StructuredReader, _: *Page) !DOMException {
+    // Owned by a by-value instance, see Context.identity_arena.
+    const arena = reader.local.ctx.identity_arena;
+    const name = try arena.dupe(u8, try reader.readBytes());
+    const message = try arena.dupe(u8, try reader.readBytes());
+    return init(message, name);
 }
 
 const Code = enum(u8) {
@@ -201,6 +218,8 @@ const Code = enum(u8) {
     transaction_inactive_error = 0xFB,
     /// Defined by IndexedDB; no legacy code, exposed via name only.
     read_only_error = 0xFA,
+    /// No legacy code, exposed via name only.
+    not_allowed_error = 0xF9,
 
     /// Maps a standard error name to its legacy code
     /// Returns .none (code 0) for non-legacy error names
@@ -234,6 +253,7 @@ const Code = enum(u8) {
             .{ "VersionError", .version_error },
             .{ "TransactionInactiveError", .transaction_inactive_error },
             .{ "ReadOnlyError", .read_only_error },
+            .{ "NotAllowedError", .not_allowed_error },
         });
         return lookup.get(name) orelse .none;
     }
@@ -244,15 +264,14 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DOMException";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const constructor = bridge.constructor(struct {
-        fn constructor(m_: ?[]const u8, n_: ?[]const u8, exec: *const js.Execution) !DOMException {
+        fn constructor(m_: ?js.NullableString, n_: ?js.NullableString, exec: *const js.Execution) !DOMException {
             return init(
-                if (m_) |m| try exec.dupeString(m) else null,
-                if (n_) |n| try exec.dupeString(n) else null,
+                if (m_) |m| try exec.dupeString(m.value) else null,
+                if (n_) |n| try exec.dupeString(n.value) else null,
             );
         }
     }.constructor, .{});

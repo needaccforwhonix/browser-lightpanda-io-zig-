@@ -103,7 +103,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLTemplateElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -157,8 +156,11 @@ pub const JsApi = struct {
 pub const Build = struct {
     pub fn created(node: *Node, frame: *Frame) !void {
         const self = node.as(Template);
-        // Create the template content DocumentFragment
-        self._content = try DocumentFragment.init(frame);
+        // The content DocumentFragment belongs to the inert template contents
+        // owner document, not to the template's own document.
+        const owner = try node.getDocument(frame).templateContentsOwner(frame);
+        self._content = try DocumentFragment.init(owner, frame);
+        self._content._template = self;
     }
 
     // Per the HTML spec's cloning steps for <template>, a deep clone must
@@ -173,7 +175,7 @@ pub const Build = struct {
         const clone_content = clone._content.asNode();
         var child_it = source._content.asNode().childrenIterator();
         while (child_it.next()) |child| {
-            if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
+            if (try child.cloneNodeForAppending(true, clone_content.getDocument(frame), frame)) |cloned_child| {
                 try frame.appendNode(clone_content, cloned_child, .{});
             }
         }

@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+const std = @import("std");
 const js = @import("js.zig");
 const v8 = js.v8;
 
@@ -48,7 +49,7 @@ pub const MemoryPressureLevel = enum(u32) {
 };
 
 pub fn memoryPressureNotification(self: Isolate, level: MemoryPressureLevel) void {
-    v8.v8__Isolate__MemoryPressureNotification(self.handle, @intFromEnum(level));
+    v8.v8__Isolate__MemoryPressureNotification(self.handle, @backingInt(level));
 }
 
 // Tells V8 how much native memory is hanging off objects in this isolate, so
@@ -58,7 +59,7 @@ pub fn adjustAmountOfExternalAllocatedMemory(self: Isolate, delta: i64) void {
 }
 
 pub fn notifyContextDisposed(self: Isolate) void {
-    _ = v8.v8__Isolate__ContextDisposedNotification(self.handle);
+    v8.v8__Isolate__ContextDisposedNotification(self.handle);
 }
 
 pub fn getHeapStatistics(self: Isolate) v8.HeapStatistics {
@@ -71,36 +72,49 @@ pub fn throwException(self: Isolate, value: *const v8.Value) *const v8.Value {
     return v8.v8__Isolate__ThrowException(self.handle, value).?;
 }
 
-pub fn initStringHandle(self: Isolate, str: []const u8) *const v8.String {
-    return v8.v8__String__NewFromUtf8(self.handle, str.ptr, v8.kNormal, @as(c_int, @intCast(str.len))).?;
+// Past v8::String::kMaxLength (just under 512 MiB on 64-bit) V8 returns an
+// empty handle; callers turn the error into "RangeError: Invalid string
+// length", as V8 throws for its own over-long strings.
+pub fn initStringHandle(self: Isolate, str: []const u8) error{InvalidStringLength}!*const v8.String {
+    const len = std.math.cast(c_int, str.len) orelse return error.InvalidStringLength;
+    return v8.v8__String__NewFromUtf8(self.handle, str.ptr, v8.kNormal, len) orelse error.InvalidStringLength;
 }
 
-pub fn initOneByteStringHandle(self: Isolate, bytes: []const u8) *const v8.String {
-    return v8.v8__String__NewFromOneByte(self.handle, bytes.ptr, v8.kNormal, @as(c_int, @intCast(bytes.len))).?;
+pub fn initOneByteStringHandle(self: Isolate, bytes: []const u8) error{InvalidStringLength}!*const v8.String {
+    const len = std.math.cast(c_int, bytes.len) orelse return error.InvalidStringLength;
+    return v8.v8__String__NewFromOneByte(self.handle, bytes.ptr, v8.kNormal, len) orelse error.InvalidStringLength;
+}
+
+// Error constructors run while an error is already being reported, so they
+// can't fail: a message is capped well below V8's limit.
+fn initMessageHandle(self: Isolate, msg: []const u8) *const v8.String {
+    const max_message_len = 64 * 1024;
+    const len: c_int = @intCast(@min(msg.len, max_message_len));
+    return v8.v8__String__NewFromUtf8(self.handle, msg.ptr, v8.kNormal, len).?;
 }
 
 pub fn createError(self: Isolate, msg: []const u8) *const v8.Value {
-    const message = self.initStringHandle(msg);
+    const message = self.initMessageHandle(msg);
     return v8.v8__Exception__Error(message).?;
 }
 
 pub fn createRangeError(self: Isolate, msg: []const u8) *const v8.Value {
-    const message = self.initStringHandle(msg);
+    const message = self.initMessageHandle(msg);
     return v8.v8__Exception__RangeError(message).?;
 }
 
 pub fn createReferenceError(self: Isolate, msg: []const u8) *const v8.Value {
-    const message = self.initStringHandle(msg);
+    const message = self.initMessageHandle(msg);
     return v8.v8__Exception__ReferenceError(message).?;
 }
 
 pub fn createSyntaxError(self: Isolate, msg: []const u8) *const v8.Value {
-    const message = self.initStringHandle(msg);
+    const message = self.initMessageHandle(msg);
     return v8.v8__Exception__SyntaxError(message).?;
 }
 
 pub fn createTypeError(self: Isolate, msg: []const u8) *const v8.Value {
-    const message = self.initStringHandle(msg);
+    const message = self.initMessageHandle(msg);
     return v8.v8__Exception__TypeError(message).?;
 }
 
@@ -130,4 +144,73 @@ pub fn initNumber(self: Isolate, val: anytype) js.Number {
 
 pub fn createExternal(self: Isolate, val: *anyopaque) *const v8.External {
     return v8.v8__External__New(self.handle, val).?;
+}
+
+// V8 copies this tag onto each promise reaction and queued microtask when it
+// is created. It follows an `await` chain, rather than then being in whatever
+// task resolved the promise. We use a u30 so that it's stored is a Smi (small
+// integer)
+pub fn getContinuationTag(self: Isolate) ?u30 {
+    const data = v8.v8__Isolate__GetContinuationPreservedEmbedderData(self.handle).?;
+    const value: *const v8.Value = @ptrCast(data);
+    if (v8.v8__Value__IsUndefined(value)) {
+        return null;
+    }
+    // Only our setContinuationTag ever sets this. So it's always either undefined
+    // or our u30 tag.
+    return @intCast(v8.v8__Integer__Value(@ptrCast(data)));
+}
+
+// Must be called inside a HandleScope.
+pub fn setContinuationTag(self: Isolate, tag: ?u30) void {
+    const data: ?*const v8.Data = if (tag) |t| @ptrCast(v8.v8__Integer__NewFromUnsigned(self.handle, t).?) else null;
+    v8.v8__Isolate__SetContinuationPreservedEmbedderData(self.handle, data);
+}
+
+const testing = @import("../../testing.zig");
+test "Isolate: continuation tag follows the awaiting code, not the resolver" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+    const isolate = local.isolate;
+
+    const State = struct {
+        isolate: Isolate,
+        seen: ?u30 = null,
+        calls: u32 = 0,
+
+        fn probe(self: *@This()) void {
+            self.seen = self.isolate.getContinuationTag();
+            self.calls += 1;
+        }
+    };
+    var state = State{ .isolate = isolate };
+
+    const driver = try local.exec(
+        \\(function(probe) {
+        \\  let resolve;
+        \\  const ready = new Promise(r => resolve = r);
+        \\  (async () => { await ready; await null; probe(); })();
+        \\  return resolve;
+        \\})
+    , null);
+    const driver_fn = js.Function{ .local = local, .handle = @ptrCast(driver.handle) };
+
+    isolate.setContinuationTag(7);
+    const resolve = try driver_fn.call(js.Function, .{local.newCallback(State.probe, &state)});
+
+    // Resolved from a differently tagged task: the continuation keeps 7.
+    isolate.setContinuationTag(9);
+    try resolve.call(void, .{});
+
+    isolate.setContinuationTag(null);
+    local.runMicrotasks();
+
+    try testing.expectEqual(1, state.calls);
+    try testing.expectEqual(7, state.seen);
+    try testing.expectEqual(null, isolate.getContinuationTag());
 }

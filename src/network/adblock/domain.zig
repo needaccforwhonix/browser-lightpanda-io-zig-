@@ -18,6 +18,7 @@
 
 const std = @import("std");
 
+const URL = @import("../../browser/URL.zig");
 const public_suffix_list = @import("../../data/public_suffix_list.zig");
 
 const Allocator = std.mem.Allocator;
@@ -70,15 +71,7 @@ fn hasEntity(entries: []const Entry) bool {
 
 fn matchEntry(e: Entry, hostname: []const u8, ent: []const u8) bool {
     if (e.entity) return std.mem.eql(u8, e.name, ent);
-    return isSubdomainOf(hostname, e.name);
-}
-
-/// Whether `hostname` is `suffix` or one of its subdomains.
-fn isSubdomainOf(hostname: []const u8, suffix: []const u8) bool {
-    if (hostname.len == suffix.len) return std.mem.eql(u8, hostname, suffix);
-    if (hostname.len < suffix.len + 1) return false;
-    const at = hostname.len - suffix.len;
-    return hostname[at - 1] == '.' and std.mem.eql(u8, hostname[at..], suffix);
+    return URL.isSubdomainOf(hostname, e.name);
 }
 
 /// Parses a `$domain=` value into its inclusions and exclusions. Entries
@@ -138,9 +131,9 @@ pub fn parse(
 
 fn registrable(host: []const u8) []const u8 {
     if (isIpLiteral(host)) return host;
-    var i = std.mem.lastIndexOfScalar(u8, host, '.') orelse return host;
+    var i = std.mem.findScalarLast(u8, host, '.') orelse return host;
     while (true) {
-        i = std.mem.lastIndexOfScalar(u8, host[0..i], '.') orelse return host;
+        i = std.mem.findScalarLast(u8, host[0..i], '.') orelse return host;
         const start = i + 1;
         if (public_suffix_list.lookup(host[start..]) == false) {
             return host[start..];
@@ -151,7 +144,7 @@ fn registrable(host: []const u8) []const u8 {
 fn entity(host: []const u8) []const u8 {
     if (isIpLiteral(host)) return "";
     const reg = registrable(host);
-    const dot = std.mem.indexOfScalar(u8, reg, '.') orelse return "";
+    const dot = std.mem.findScalar(u8, reg, '.') orelse return "";
     return reg[0..dot];
 }
 

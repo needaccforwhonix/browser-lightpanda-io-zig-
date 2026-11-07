@@ -28,9 +28,11 @@ const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const Document = @import("../../Document.zig");
 const TreeWalker = @import("../../TreeWalker.zig");
+const ElementInternals = @import("../../ElementInternals.zig");
 const CustomElementDefinition = @import("../../CustomElementDefinition.zig");
 
 const HtmlElement = @import("../Html.zig");
+const Form = @import("Form.zig");
 
 const log = lp.log;
 const String = lp.String;
@@ -44,12 +46,150 @@ _definition: ?*CustomElementDefinition,
 _connected_callback_invoked: bool = false,
 _disconnected_callback_invoked: bool = false,
 _upgrade_failed: bool = false, // a failed upgrade is never retried
+_upgrade_in_progress: bool = false,
+_upgrade_candidate: bool = false, // listed in a frame's _undefined_custom_elements
+_internals: ?*ElementInternals = null,
+_form_owner: ?*Form = null, // form-associated element only
+_form_disabled: bool = false, // form-associated element only
 
 pub fn asElement(self: *Custom) *Element {
     return Factory.protoOf(self).asElement();
 }
 pub fn asNode(self: *Custom) *Node {
     return self.asElement().asNode();
+}
+
+pub fn isFormAssociated(self: *const Custom) bool {
+    const definition = self._definition orelse return false;
+    return definition.form_associated;
+}
+
+// Barred from constraint validation: disabled, readonly, or inside a datalist.
+pub fn willValidate(self: *Custom) bool {
+    const element = self.asElement();
+    if (element.isDisabled()) {
+        return false;
+    }
+    if (element.hasAttributeSafe(comptime .wrap("readonly"))) {
+        return false;
+    }
+    var node = element.asNode()._parent;
+    while (node) |n| : (node = n._parent) {
+        const el = n.is(Element) orelse continue;
+        if (el.getTag() == .datalist) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn registerFormAssociated(self: *Custom, frame: *Frame) !void {
+    // @frame.arena
+    try frame._form_associated.append(frame.page_arena, self);
+}
+
+pub fn formStateChanged(self: *Custom, frame: *Frame) void {
+    if (self.isFormAssociated() == false or self._upgrade_in_progress) {
+        return;
+    }
+    const element = self.asElement();
+
+    const owner = Form.ownerOf(element);
+    if (owner != self._form_owner) {
+        // new owner
+        self._form_owner = owner;
+        frame._ce_reactions.enqueueFormAssociated(frame, self, owner) catch |err| {
+            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+        };
+    }
+
+    const disabled = element.isDisabled();
+    if (disabled != self._form_disabled) {
+        // disabled state changed
+        self._form_disabled = disabled;
+        frame._ce_reactions.enqueueFormDisabled(frame, self, disabled) catch |err| {
+            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
+        };
+    }
+}
+
+// `child` was inserted or removed from `parent`. A form-associated element
+// might have changed (e.g. maybe it moved under a disabled fieldset).
+// Only called when the frame has form-associated elements.
+pub fn formTreeChanged(parent: *Node, child: *Node, frame: *Frame) void {
+    // a non-element can't be a container for our custom element
+    const el = child.is(Element) orelse return;
+
+    var has_form = false;
+    if (child.firstChild() == null) {
+        // common case since the parser inserts every element before its children
+        if (el.is(Custom)) |custom| {
+            custom.formStateChanged(frame);
+        } else {
+            has_form = el.getTag() == .form;
+        }
+    } else {
+        var tw = TreeWalker.Full.Elements.init(child, .{});
+        while (tw.next()) |descendant| {
+            if (descendant.is(Custom)) |custom| {
+                custom.formStateChanged(frame);
+            } else if (descendant.getTag() == .form) {
+                has_form = true;
+            }
+        }
+    }
+
+    if (has_form) {
+        formAttributeTargetsChanged(frame);
+    }
+
+    formLegendMoved(parent, child, frame);
+}
+
+// `child` was inserted into or removed from `parent`. Legends moving around in
+// a fieldset can alter the disabled state of its other descendants.
+pub fn formLegendMoved(parent: *Node, child: *Node, frame: *Frame) void {
+    const el = child.is(Element) orelse return;
+    if (el.getTag() != .legend) {
+        return;
+    }
+    const fieldset = parent.is(Element) orelse return;
+    if (fieldset.getTag() == .fieldset) {
+        formStateChangedInSubtree(fieldset.asNode(), frame);
+    }
+}
+
+pub fn formAttributeChanged(element: *Element, name: String, frame: *Frame) void {
+    if (name.eql(comptime .wrap("disabled"))) {
+        if (element.getTag() == .fieldset) {
+            formStateChangedInSubtree(element.asNode(), frame);
+        } else if (element.is(Custom)) |custom| {
+            custom.formStateChanged(frame);
+        }
+    } else if (name.eql(comptime .wrap("form"))) {
+        if (element.is(Custom)) |custom| {
+            custom.formStateChanged(frame);
+        }
+    } else if (name.eql(comptime .wrap("id"))) {
+        formAttributeTargetsChanged(frame);
+    }
+}
+
+fn formStateChangedInSubtree(root: *Node, frame: *Frame) void {
+    var tw = TreeWalker.FullExcludeSelf.ElementsOf(Custom).init(root, .{});
+    while (tw.next()) |custom| {
+        custom.formStateChanged(frame);
+    }
+}
+
+// An id changed or a form came or went: a form attribute can now resolve to
+// a different form.
+fn formAttributeTargetsChanged(frame: *Frame) void {
+    for (frame._form_associated.items) |custom| {
+        if (custom.asElement().hasAttributeSafe(comptime .wrap("form"))) {
+            custom.formStateChanged(frame);
+        }
+    }
 }
 
 // Reactions are queued via enqueue* and fired via fireReaction at the outer
@@ -62,6 +202,7 @@ pub fn asNode(self: *Custom) *Node {
 pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *Element, frame: *Frame) error{OutOfMemory}!void {
     // Autonomous custom element
     if (element.is(Custom)) |custom| {
+        if (custom._upgrade_in_progress) return;
         // Upgrade if a definition exists but isn't yet attached
         if (custom._definition == null) {
             if (custom._upgrade_failed) {
@@ -83,7 +224,11 @@ pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *E
                 CustomElementRegistry.upgradeCustomElement(custom, definition, frame) catch {};
                 return;
             }
-            // Element is undefined and no definition exists yet — nothing to queue.
+
+            if (!custom._upgrade_candidate) {
+                custom._upgrade_candidate = true;
+                try frame._undefined_custom_elements.append(frame.page_arena, custom);
+            }
             return;
         }
 
@@ -95,6 +240,10 @@ pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *E
         return;
     }
 
+    if (element._flags.builtin_undefined) {
+        return tryUpgradeBuiltIn(element, frame);
+    }
+
     // Customized built-in element - check if it actually has a definition first
     if (frame.getCustomizedBuiltInDefinition(element) == null) {
         return;
@@ -103,13 +252,13 @@ pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *E
     if (comptime from_parser) {
         // From parser, we know the element is brand new; skip the dedup check.
         try frame._customized_builtin_connected_callback_invoked.put(
-            frame.arena,
+            frame.page_arena,
             element,
             {},
         );
     } else {
         const gop = try frame._customized_builtin_connected_callback_invoked.getOrPut(
-            frame.arena,
+            frame.page_arena,
             element,
         );
         if (gop.found_existing) {
@@ -124,7 +273,7 @@ pub fn enqueueConnectedCallbackOnElement(comptime from_parser: bool, element: *E
 
 pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        if (custom._definition == null) return;
+        if (custom._definition == null or custom._upgrade_in_progress) return;
         if (custom._disconnected_callback_invoked) return;
         custom._disconnected_callback_invoked = true;
         custom._connected_callback_invoked = false;
@@ -139,7 +288,7 @@ pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) vo
     }
 
     const gop = frame._customized_builtin_disconnected_callback_invoked.getOrPut(
-        frame.arena,
+        frame.page_arena,
         element,
     ) catch return;
     if (gop.found_existing) return;
@@ -157,7 +306,7 @@ pub fn enqueueDisconnectedCallbackOnElement(element: *Element, frame: *Frame) vo
 // moves with it.
 pub fn enqueueMoveCallbackOnElement(element: *Element, frame: *Frame) void {
     const eligible = if (element.is(Custom)) |custom|
-        custom._definition != null
+        custom._definition != null and !custom._upgrade_in_progress
     else
         frame.getCustomizedBuiltInDefinition(element) != null;
 
@@ -191,7 +340,7 @@ pub fn enqueueShadowTreeCallbacks(host: *Element, comptime reaction: enum { conn
 
 pub fn enqueueAdoptedCallbackOnElement(element: *Element, old_document: *Document, new_document: *Document, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
-        if (custom._definition == null) return;
+        if (custom._definition == null or custom._upgrade_in_progress) return;
     } else {
         if (frame.getCustomizedBuiltInDefinition(element) == null) return;
     }
@@ -202,6 +351,7 @@ pub fn enqueueAdoptedCallbackOnElement(element: *Element, old_document: *Documen
 
 pub fn enqueueAttributeChangedCallbackOnElement(element: *Element, name: String, old_value: ?String, new_value: ?String, namespace: ?String, frame: *Frame) void {
     if (element.is(Custom)) |custom| {
+        if (custom._upgrade_in_progress) return;
         const definition = custom._definition orelse return;
         if (!definition.isAttributeObserved(name)) return;
     } else {
@@ -217,6 +367,14 @@ pub fn enqueueAttributeChangedCallbackOnElement(element: *Element, name: String,
 // Filtering already happened at enqueue time, so just fire unconditionally.
 pub fn fireReaction(reaction: Reaction, frame: *Frame) void {
     switch (reaction) {
+        .upgrade => |u| {
+            if (u.element._definition != null or u.element._upgrade_failed) return;
+            const CustomElementRegistry = @import("../../CustomElementRegistry.zig");
+            // queue on the caller's frame, which might not be the element's
+            // (e.g. iframe.contentDocument.body.innerHTML = '....')
+            const owner = u.element.asNode().ownerFrame(frame) orelse frame;
+            CustomElementRegistry.upgradeCustomElement(u.element, u.definition, owner) catch {};
+        },
         .connected => |el| {
             if (el.is(Custom)) |custom| {
                 custom.invokeCallback("connectedCallback", .{}, frame);
@@ -246,6 +404,9 @@ pub fn fireReaction(reaction: Reaction, frame: *Frame) void {
             }
         },
         .move => |el| invokeCallbackOnElement(el, "move", .{}, frame),
+        .form_associated => |f| f.element.invokeCallback("formAssociatedCallback", .{f.form}, frame),
+        .form_disabled => |f| f.element.invokeCallback("formDisabledCallback", .{f.disabled}, frame),
+        .form_reset => |custom| custom.invokeCallback("formResetCallback", .{}, frame),
     }
 }
 
@@ -275,26 +436,45 @@ fn invokeCallbackOnElement(element: *Element, comptime callback_name: [:0]const 
     }
 }
 
-// Check if element has "is" attribute and attach customized built-in definition
-pub fn checkAndAttachBuiltIn(element: *Element, frame: *Frame) !void {
+pub fn initBuiltIn(element: *Element, frame: *Frame) !void {
     const is_value = element.getAttributeSafe(comptime .wrap("is")) orelse return;
+    element._flags.builtin_undefined = true;
+    if (frame.window.getCustomElements()._definitions.get(is_value)) |definition| {
+        return upgradeBuiltIn(element, definition, frame);
+    }
+    const CustomElementRegistry = @import("../../CustomElementRegistry.zig");
+    if (CustomElementRegistry.isValidName(is_value)) {
+        try frame._undefined_builtins.put(frame.page_arena, element, try frame.dupeString(is_value));
+    }
+}
 
-    const custom_elements = frame.window.getCustomElements();
-    const definition = custom_elements._definitions.get(is_value) orelse return;
+pub fn upgradeBuiltIns(definition: *CustomElementDefinition, frame: *Frame) !void {
+    var candidates: std.ArrayList(*Element) = .empty;
+    for (frame._undefined_builtins.keys(), frame._undefined_builtins.values()) |element, is_value| {
+        if (std.mem.eql(u8, is_value, definition.name) and element.asNode().isConnected()) {
+            try candidates.append(frame.call_arena, element);
+        }
+    }
+    for (candidates.items) |element| {
+        _ = frame._undefined_builtins.swapRemove(element);
+        try upgradeBuiltIn(element, definition, frame);
+    }
+}
 
-    const extends_tag = definition.extends orelse return;
-    if (extends_tag != element.getTag()) {
+pub fn tryUpgradeBuiltIn(element: *Element, frame: *Frame) error{OutOfMemory}!void {
+    const is_value = frame._undefined_builtins.get(element) orelse return;
+    const definition = frame.window.getCustomElements()._definitions.get(is_value) orelse return;
+    _ = frame._undefined_builtins.swapRemove(element);
+    return upgradeBuiltIn(element, definition, frame);
+}
+
+/// https://html.spec.whatwg.org/#concept-upgrade-an-element
+/// Attempted once: a failed upgrade is never retried.
+fn upgradeBuiltIn(element: *Element, definition: *CustomElementDefinition, frame: *Frame) error{OutOfMemory}!void {
+    if (definition.extends != element.getTag()) {
         return;
     }
 
-    // Attach the definition
-    try frame.setCustomizedBuiltInDefinition(element, definition);
-
-    // Reset callback flags since this is a fresh upgrade
-    _ = frame._customized_builtin_connected_callback_invoked.remove(element);
-    _ = frame._customized_builtin_disconnected_callback_invoked.remove(element);
-
-    // Invoke constructor
     const prev_upgrading = frame._upgrading_element;
     const prev_consumed = frame._upgrading_consumed;
     const node = element.asNode();
@@ -326,9 +506,27 @@ pub fn checkAndAttachBuiltIn(element: *Element, frame: *Frame) !void {
 
     var caught: js.TryCatch.Caught = .{};
     _ = local.toLocal(definition.constructor).newInstance(&caught) catch |err| {
-        log.warn(.js, "custom builtin ctor", .{ .name = is_value, .err = err, .caught = caught });
+        log.debug(.js, "custom builtin ctor", .{ .name = definition.name, .err = err, .caught = caught });
         return;
     };
+
+    element._flags.builtin_undefined = false;
+    try frame.setCustomizedBuiltInDefinition(element, definition);
+    frame.styleChanged(); // the element now matches :defined
+    try enqueueUpgradeReactions(element, definition, frame);
+}
+
+/// The reactions an upgrade queues for an element's existing state.
+pub fn enqueueUpgradeReactions(element: *Element, definition: *CustomElementDefinition, frame: *Frame) error{OutOfMemory}!void {
+    for (element.attributeEntries()) |*attr| {
+        const name = lp.String.wrap(attr.name());
+        if (definition.isAttributeObserved(name)) {
+            enqueueAttributeChangedCallbackOnElement(element, name, null, .wrap(attr.value()), null, frame);
+        }
+    }
+    if (element.asNode().isConnected()) {
+        try enqueueConnectedCallbackOnElement(false, element, frame);
+    }
 }
 
 fn invokeCallback(self: *Custom, comptime callback_name: [:0]const u8, args: anytype, frame: *Frame) void {
@@ -350,7 +548,10 @@ pub const JsApi = struct {
     pub const bridge = js.Bridge(Custom);
 
     pub const Meta = struct {
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
+        // The template only applies to wrappers created outside construction:
+        // undefined elements, or a defined one first seen by an isolated world.
+        // Both get HTMLElement.prototype.
+        pub const wrap_as = HtmlElement.JsApi;
     };
 };

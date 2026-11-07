@@ -25,12 +25,12 @@ const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
-const HtmlElement = @import("../Html.zig");
-const Form = @import("Form.zig");
-const Event = @import("../../Event.zig");
-const ValidityState = @import("ValidityState.zig");
 
+const HtmlElement = @import("../Html.zig");
 const popover = @import("../popover.zig");
+
+const Form = @import("Form.zig");
+const ValidityState = @import("ValidityState.zig");
 
 const Button = @This();
 
@@ -52,33 +52,18 @@ pub fn asNode(self: *Button) *Node {
 }
 
 pub fn getType(self: *const Button) []const u8 {
-    return self.asConstElement().getAttributeInterned("type") orelse "submit";
+    const value = self.asConstElement().getAttributeInterned("type") orelse return "submit";
+    if (std.ascii.eqlIgnoreCase(value, "reset")) {
+        return "reset";
+    }
+    if (std.ascii.eqlIgnoreCase(value, "button")) {
+        return "button";
+    }
+    return "submit";
 }
 
-pub fn getForm(self: *Button, frame: *Frame) ?*Form {
-    const element = self.asElement();
-
-    // If form attribute exists, ONLY use that (even if it references nothing)
-    if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
-        // form= resolves in the control's own tree (shadow root or document),
-        // not the calling realm's. getElementByIdFromNode walks to that root.
-        if (frame.getElementByIdFromNode(element.asNode(), form_id)) |form_element| {
-            return form_element.is(Form);
-        }
-        // form attribute present but invalid - no form owner
-        return null;
-    }
-
-    // No form attribute - traverse ancestors looking for a <form>
-    var node = element.asNode()._parent;
-    while (node) |n| {
-        if (n.is(Element.Html.Form)) |form| {
-            return form;
-        }
-        node = n._parent;
-    }
-
-    return null;
+pub fn getForm(self: *Button) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *Button, frame: *Frame) !js.Array {
@@ -97,7 +82,7 @@ fn getLabels(self: *Button, frame: *Frame) !js.Array {
 
 fn getFormAction(self: *Button, frame: *Frame) ![]const u8 {
     const element = self.asElement();
-    const owner_url = element.ownerFrame(frame).url;
+    const owner_url = element.asNode().ownerDocument(frame).?.getURL(frame);
     const action = element.getAttributeSafe(comptime .wrap("formaction")) orelse return owner_url;
     if (action.len == 0) {
         return owner_url;
@@ -161,13 +146,8 @@ fn getValidationMessage(self: *const Button) []const u8 {
     return self._custom_validity orelse "";
 }
 
-pub fn checkValidity(self: *Button, frame: *Frame) !bool {
-    if (!self.getWillValidate()) return true;
-    if (self._custom_validity == null) return true;
-
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame._page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-    return false;
+fn checkValidity(self: *Button, frame: *Frame) !bool {
+    return ValidityState.checkValidity(self.asElement(), frame);
 }
 
 fn reportValidity(self: *Button, frame: *Frame) !bool {
@@ -186,8 +166,8 @@ pub fn hasCustomValidity(self: *const Button) bool {
     return self._custom_validity != null;
 }
 
-fn getPopoverTargetElement(self: *Button, frame: *Frame) ?*Element {
-    return popover.invokerTarget(self.asNode(), self._popover_target, frame);
+fn getPopoverTargetElement(self: *Button) ?*Element {
+    return popover.invokerTarget(self.asNode(), self._popover_target);
 }
 
 fn setPopoverTargetElement(self: *Button, value: ?*Element, frame: *Frame) !void {
@@ -216,7 +196,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLButtonElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -224,7 +203,6 @@ pub const JsApi = struct {
 
     pub const disabled = reflect.boolean("disabled");
     pub const name = reflect.string("name");
-    pub const required = reflect.boolean("required");
     pub const form = bridge.accessor(Button.getForm, null, .{});
     pub const formAction = bridge.accessor(Button.getFormAction, Button.setFormAction, .{ .ce_reactions = true });
     pub const formEnctype = bridge.accessor(Button.getFormEnctype, Button.setFormEnctype, .{ .ce_reactions = true });

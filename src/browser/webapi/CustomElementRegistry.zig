@@ -45,14 +45,8 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
 
     // Parse and validate extends option
     const extends_tag: ?Element.Tag = if (options.extends) |extends_name| blk: {
-        const tag = std.meta.stringToEnum(Element.Tag, extends_name) orelse return error.NotSupported;
-
-        // Can't extend custom elements
-        if (tag == .custom) {
-            return error.NotSupported;
-        }
-
-        break :blk tag;
+        // null for custom elements, unknown names and Tag groupings (heading, media)
+        break :blk Element.Tag.parseForMatch(extends_name) orelse return error.NotSupported;
     } else null;
 
     // Do not use getOrPut here to hold the GetOrPut entry until we need to write
@@ -78,13 +72,14 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
             var js_arr = observed_attrs.toArray();
             for (0..js_arr.len()) |i| {
                 const attr_val = js_arr.get(@intCast(i)) catch continue;
-                const attr_name = attr_val.toStringSliceWithAlloc(frame.arena) catch continue;
-                definition.observed_attributes.put(frame.arena, attr_name, {}) catch continue;
+                const attr_name = attr_val.toStringSliceWithAlloc(frame.page_arena) catch continue;
+                definition.observed_attributes.put(frame.page_arena, attr_name, {}) catch continue;
             }
         }
     }
 
-    // Read disabledFeatures static property: ["shadow"] makes attachShadow throw.
+    // Read disabledFeatures static property: ["shadow"] makes attachShadow throw
+    // ["internals"] makes attachInternals throw.
     if (constructor.getPropertyValue("disabledFeatures") catch null) |disabled| {
         if (disabled.isArray()) {
             var js_arr = disabled.toArray();
@@ -93,18 +88,23 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
                 const feature = val.toSSO(false) catch continue;
                 if (feature.eql(comptime .wrap("shadow"))) {
                     definition.disable_shadow = true;
+                } else if (feature.eql(comptime .wrap("internals"))) {
+                    definition.disable_internals = true;
                 }
             }
         }
     }
 
-    const gop = try self._definitions.getOrPut(frame.arena, owned_name);
+    if (constructor.getPropertyValue("formAssociated") catch null) |form_associated| {
+        definition.form_associated = form_associated.toBool();
+    }
+
+    const gop = try self._definitions.getOrPut(frame.page_arena, owned_name);
     if (gop.found_existing) {
         return error.NotSupported;
     }
     gop.key_ptr.* = owned_name;
     gop.value_ptr.* = definition;
-    frame.styleChanged();
 
     // Upgrade any undefined custom elements with this name
     var idx: usize = 0;
@@ -128,6 +128,10 @@ pub fn define(self: *CustomElementRegistry, name: []const u8, constructor: js.Fu
         _ = frame._undefined_custom_elements.swapRemove(idx);
     }
 
+    if (definition.isCustomizedBuiltIn()) {
+        try Custom.upgradeBuiltIns(definition, frame);
+    }
+
     if (self._when_defined.fetchRemove(name)) |entry| {
         frame.js.toLocal(entry.value).resolve("whenDefined", constructor);
     }
@@ -149,6 +153,9 @@ pub fn getName(self: *CustomElementRegistry, constructor: js.Function) ?[]const 
 }
 
 pub fn upgrade(self: *CustomElementRegistry, root: *Node, frame: *Frame) !void {
+    if (root.getDocument(frame)._frame == null) {
+        return;
+    }
     try upgradeNode(self, root, frame);
 }
 
@@ -160,7 +167,7 @@ pub fn whenDefined(self: *CustomElementRegistry, name: []const u8, frame: *Frame
 
     try validateName(name);
 
-    const gop = try self._when_defined.getOrPut(frame.arena, name);
+    const gop = try self._when_defined.getOrPut(frame.page_arena, name);
     if (gop.found_existing) {
         return local.toLocal(gop.value_ptr.*).promise();
     }
@@ -187,7 +194,7 @@ fn upgradeNode(self: *CustomElementRegistry, node: *Node, frame: *Frame) !void {
 
 fn upgradeElement(self: *CustomElementRegistry, element: *Element, frame: *Frame) !void {
     const custom = element.is(Custom) orelse {
-        return Custom.checkAndAttachBuiltIn(element, frame);
+        return Custom.tryUpgradeBuiltIn(element, frame);
     };
 
     if (custom._definition != null or custom._upgrade_failed) {
@@ -208,6 +215,12 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
     custom._disconnected_callback_invoked = false;
 
     const node = custom.asNode();
+    try Custom.enqueueUpgradeReactions(custom.asElement(), definition, frame);
+
+    // During construction the element is precustomized, not yet custom.
+    custom._upgrade_in_progress = true;
+    defer custom._upgrade_in_progress = false;
+
     const prev_upgrading = frame._upgrading_element;
     const prev_consumed = frame._upgrading_consumed;
     frame._upgrading_element = node;
@@ -231,7 +244,7 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
             custom._definition = null;
             return err;
         }
-        log.warn(.js, "custom element upgrade", .{ .name = definition.name, .err = err });
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .err = err });
         upgradeFailed(custom);
         if (try_catch.exceptionValue()) |exc| {
             frame.window.reportError(exc, frame) catch {};
@@ -242,7 +255,7 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
     const same = if (object.toZig(*Node)) |result| result == node else |_| false;
     if (!same) {
         // the construction result must be the element being upgraded.
-        log.warn(.js, "custom element upgrade", .{ .name = definition.name, .reason = "constructor returned another value" });
+        log.debug(.js, "custom element upgrade", .{ .name = definition.name, .reason = "constructor returned another value" });
         upgradeFailed(custom);
         const exc: js.Value = .{
             .local = local,
@@ -252,19 +265,17 @@ pub fn upgradeCustomElement(custom: *Custom, definition: *CustomElementDefinitio
         return error.CustomElementUpgradeFailed;
     }
 
-    // Enqueue attributeChangedCallback for existing observed attributes
-    const element = custom.asElement();
-    for (element.attributeEntries()) |*attr| {
-        const name = lp.String.wrap(attr.name());
-        if (definition.isAttributeObserved(name)) {
-            Custom.enqueueAttributeChangedCallbackOnElement(element, name, null, .wrap(attr.value()), null, frame);
-        }
-    }
+    // Insertions and removals during construction queue nothing, so the
+    // dedup flags must reflect where the constructor left the element.
+    const connected = node.isConnected();
+    frame.styleChanged(); // the element now matches :defined
+    custom._connected_callback_invoked = connected;
+    custom._disconnected_callback_invoked = connected == false;
 
-    if (node.isConnected()) {
-        Custom.enqueueConnectedCallbackOnElement(false, element, frame) catch |err| {
-            log.warn(.bug, "ce_reactions enqueue fail", .{ .err = err });
-        };
+    if (definition.form_associated) {
+        try custom.registerFormAssociated(frame);
+        custom._upgrade_in_progress = false;
+        custom.formStateChanged(frame);
     }
 }
 
@@ -274,16 +285,23 @@ fn upgradeFailed(custom: *Custom) void {
 }
 
 fn validateName(name: []const u8) !void {
-    if (name.len == 0) {
+    if (!isValidName(name)) {
         return error.SyntaxError;
     }
+}
 
-    if (std.mem.indexOf(u8, name, "-") == null) {
-        return error.SyntaxError;
+/// https://html.spec.whatwg.org/#valid-custom-element-name
+pub fn isValidName(name: []const u8) bool {
+    if (name.len == 0) {
+        return false;
+    }
+
+    if (std.mem.find(u8, name, "-") == null) {
+        return false;
     }
 
     if (name[0] < 'a' or name[0] > 'z') {
-        return error.SyntaxError;
+        return false;
     }
 
     const reserved_names = [_][]const u8{
@@ -299,22 +317,23 @@ fn validateName(name: []const u8) !void {
 
     for (reserved_names) |reserved| {
         if (std.mem.eql(u8, name, reserved)) {
-            return error.SyntaxError;
+            return false;
         }
     }
 
     for (name) |c| {
         if (std.ascii.isUpper(c)) {
-            return error.SyntaxError;
+            return false;
         }
 
         // Reject control characters and specific invalid characters
         // per elementLocalNameRegex: [^\0\t\n\f\r\u0020/>]*
         switch (c) {
-            0, '\t', '\n', '\r', 0x0C, ' ', '/', '>' => return error.SyntaxError,
+            0, '\t', '\n', '\r', 0x0C, ' ', '/', '>' => return false,
             else => {},
         }
     }
+    return true;
 }
 
 pub const JsApi = struct {
@@ -323,7 +342,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "CustomElementRegistry";
         pub var class_id: bridge.ClassId = undefined;
-        pub const prototype_chain = bridge.prototypeChain();
     };
 
     pub const define = bridge.function(CustomElementRegistry.define, .{ .ce_reactions = true });
@@ -335,6 +353,13 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: CustomElementRegistry" {
-    testing.expectLog(&.{ .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js, .js });
+    if (comptime lp.IS_DEBUG) {
+        // Our reaction stack is per frame. The test opens the scope in the
+        // caller's frame, but attributeChange queues the reaction on the
+        // element's frame. When those differ, the reaction goes into the
+        // backup queue. We should probably move it from the Frame to the Page.
+        // this only logs in debug
+        testing.expectLog(&.{ .bug, .bug, .bug });
+    }
     try testing.htmlRunner("custom_elements", .{});
 }

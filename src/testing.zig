@@ -18,6 +18,10 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
+const zenai = @import("zenai");
+const http = @import("network/http.zig");
+const sys_net = @import("sys/net.zig");
+const libcurl = @import("sys/libcurl.zig");
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
@@ -38,6 +42,12 @@ pub const arena_allocator = arena_instance.allocator();
 
 pub fn reset() void {
     _ = arena_instance.reset(.retain_capacity);
+}
+
+/// Path of `name` inside a std.testing.tmpDir, relative to the cwd like the
+/// tmpDir itself, since some tools refuse absolute paths.
+pub fn tmpPath(tmp: *const std.testing.TmpDir, name: []const u8) ![:0]const u8 {
+    return std.Io.Dir.path.joinZ(arena_allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, name });
 }
 
 const App = @import("App.zig");
@@ -66,8 +76,8 @@ pub fn expectEqual(expected: anytype, actual: anytype) !void {
             }
         },
         .@"struct" => |structType| {
-            inline for (structType.fields) |field| {
-                try expectEqual(@field(expected, field.name), @field(actual, field.name));
+            inline for (structType.field_names) |field_name| {
+                try expectEqual(@field(expected, field_name), @field(actual, field_name));
             }
             return;
         },
@@ -90,9 +100,9 @@ pub fn expectEqual(expected: anytype, actual: anytype) !void {
             const actualTag = @as(Tag, actual);
             try expectEqual(expectedTag, actualTag);
 
-            inline for (std.meta.fields(@TypeOf(actual))) |fld| {
-                if (std.mem.eql(u8, fld.name, @tagName(actualTag))) {
-                    try expectEqual(@field(expected, fld.name), @field(actual, fld.name));
+            inline for (@typeInfo(@TypeOf(actual)).@"union".field_names) |field_name| {
+                if (std.mem.eql(u8, field_name, @tagName(actualTag))) {
+                    try expectEqual(@field(expected, field_name), @field(actual, field_name));
                     return;
                 }
             }
@@ -148,7 +158,7 @@ fn isStringArray(comptime T: type) bool {
 }
 
 const TraitFn = fn (type) bool;
-pub fn is(comptime id: std.builtin.TypeId) TraitFn {
+pub fn is(comptime id: std.lang.TypeId) TraitFn {
     const Closure = struct {
         fn trait(comptime T: type) bool {
             return id == @typeInfo(T);
@@ -157,7 +167,7 @@ pub fn is(comptime id: std.builtin.TypeId) TraitFn {
     return Closure.trait;
 }
 
-fn isPtrTo(comptime id: std.builtin.TypeId) TraitFn {
+fn isPtrTo(comptime id: std.lang.TypeId) TraitFn {
     const Closure = struct {
         fn trait(comptime T: type) bool {
             if (!comptime isSingleItemPtr(T)) return false;
@@ -333,6 +343,7 @@ const HtmlRunnerOpts = struct {
         .worker = true,
         .iframe = true,
     },
+    experimental_features: Config.ExperimentalFeatures = .{},
 };
 
 // Create a fresh page on `test_session` and return its root frame — for tests
@@ -364,6 +375,9 @@ pub fn htmlRunner(comptime path: []const u8, opts: HtmlRunnerOpts) !void {
         .worker = true,
         .iframe = true,
     };
+
+    test_session.experimental_features = opts.experimental_features;
+    defer test_session.experimental_features = .{};
 
     const root = try std.fs.path.joinZ(arena_allocator, &.{ WEB_API_TEST_ROOT, path });
     const stat = std.Io.Dir.cwd().statFile(io, root, .{}) catch |err| {
@@ -417,8 +431,7 @@ fn runWebApiTest(test_file: [:0]const u8, timeout_ms: u32) !void {
     const page = try test_session.createPage();
     defer page.close();
 
-    const url = try std.fmt.allocPrintSentinel(
-        arena_allocator,
+    const url = try arena_allocator.printSentinel(
         "http://127.0.0.1:9582/{s}",
         .{test_file},
         0,
@@ -444,11 +457,20 @@ fn runWebApiTest(test_file: [:0]const u8, timeout_ms: u32) !void {
     var wait_ms: u32 = timeout_ms;
     var timer: std.Io.Timestamp = .now(lp.io, .boot);
     while (true) {
+        const sleep_ms: usize = switch (try runner.tickForFrame(page.frame_id, 20, .{ .until = .done })) {
+            .done => @min(test_session.browser.msToNextTask() orelse 20, 20), // could be at BLOCKING_NESTING, so wait a bit more
+            .ok => |next_ms| @min(next_ms, 20),
+        };
+
         var try_catch: js.TryCatch = undefined;
         try_catch.init(&ls.local);
         defer try_catch.deinit();
 
-        const js_val = ls.local.exec("testing.assertOk()", "testing.assertOk()") catch |err| {
+        const js_val = ls.local.exec(
+            // testing is undefined until testing.js is run
+            "typeof testing === 'undefined' ? false : testing.assertOk()",
+            "testing.assertOk()",
+        ) catch |err| {
             const caught = try_catch.caughtOrError(arena_allocator, err);
             std.debug.print("{s}: test failure\nError: {f}\n", .{ test_file, caught });
             return err;
@@ -456,10 +478,6 @@ fn runWebApiTest(test_file: [:0]const u8, timeout_ms: u32) !void {
         if (js_val.isTrue()) {
             return;
         }
-        const sleep_ms: usize = switch (try runner.tickForFrame(page.frame_id, 20, .{ .until = .done })) {
-            .done => 20,
-            .ok => |next_ms| @min(next_ms, 20),
-        };
 
         const lap: std.Io.Timestamp = .now(lp.io, .boot);
         const ms_elapsed: u64 = @intCast(timer.durationTo(lap).toMilliseconds());
@@ -469,7 +487,14 @@ fn runWebApiTest(test_file: [:0]const u8, timeout_ms: u32) !void {
             return error.TestTimedOut;
         }
         wait_ms -= @intCast(ms_elapsed);
-        lp.io.sleep(.fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
+
+        // WebSocket connection doesn't count as pending work, but we much prefer
+        // waiting on on activity than a blind sleep.
+        const http_client = &test_session.browser.http_client;
+        const waited = http_client.activity().ws_conns > 0 and try http_client.tick(@intCast(sleep_ms));
+        if (waited == false) {
+            lp.io.sleep(.fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
+        }
     }
 }
 
@@ -480,8 +505,7 @@ pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !Session.Pag
     const page = try test_session.createPage();
     errdefer page.close();
 
-    const url = try std.fmt.allocPrintSentinel(
-        arena_allocator,
+    const url = try arena_allocator.printSentinel(
         "http://127.0.0.1:9582/{s}{s}",
         .{ WEB_API_TEST_ROOT, test_file },
         0,
@@ -498,19 +522,59 @@ pub fn pageTest(comptime test_file: []const u8, opts: PageTestOpts) !Session.Pag
 const Server = @import("server/Server.zig");
 const TestWSServer = @import("TestWSServer.zig");
 const TestHTTPServer = @import("TestHTTPServer.zig");
+const test_routes = @import("test_routes.zig");
+pub const raw_responses = test_routes.raw_responses;
+pub const hold_loads = &test_routes.hold_loads;
 
 pub var test_cdp_server: ?*Server = null;
+pub var test_cdp_port: u16 = 0;
 var test_cdp_server_thread: ?std.Thread = null;
 var test_http_server: ?TestHTTPServer = null;
 var test_http_server_thread: ?std.Thread = null;
 var test_ws_server: ?TestWSServer = null;
 var test_ws_server_thread: ?std.Thread = null;
 
-// Server-side state for the /sse/* endpoints. sse_flag proves progressive
-// delivery (see /sse/streaming); sse_reconnect_hits makes /sse/reconnect
-// serve a different stream on the second connection.
-var sse_flag = std.atomic.Value(bool).init(false);
-var sse_reconnect_hits = std.atomic.Value(usize).init(0);
+/// The real port behind 9582, for clients that bypass libcurl's remap.
+fn testHttpPort() u16 {
+    return test_http_server.?.listener.?.socket.address.getPort();
+}
+
+/// Point the TypeSafe client at the test server's `/v1/systemone` mock, so a
+/// tool that asks Jev runs its real path without reaching the real API. The
+/// base URL is needed because zenai talks `std.http`, which libcurl's test
+/// port remap does not reach.
+pub const MockJev = struct {
+    pub fn start(arena: std.mem.Allocator) !MockJev {
+        _ = setenv(@constCast(zenai.typesafe.env_var_name), @constCast("test-key"), 1);
+        const base_url = try arena.printSentinel("http://127.0.0.1:{d}", .{testHttpPort()}, 0);
+        _ = setenv(@constCast(zenai.typesafe.base_url_env_var_name), base_url, 1);
+        return .{};
+    }
+
+    /// The decision is answered as usual and the verification re-read after
+    /// it fails: the API breaking once a tool has already acted.
+    pub fn startFailingVerification(arena: std.mem.Allocator) !MockJev {
+        const mock = try start(arena);
+        _ = setenv(@constCast(zenai.typesafe.env_var_name), @constCast(test_routes.no_verify_key), 1);
+        return mock;
+    }
+
+    /// Answers after a delay, so a test can see whether the caller kept its
+    /// own page running while it waited.
+    pub fn startSlow(arena: std.mem.Allocator) !MockJev {
+        const mock = try start(arena);
+        _ = setenv(@constCast(zenai.typesafe.env_var_name), @constCast(test_routes.slow_key), 1);
+        return mock;
+    }
+
+    pub fn stop(_: MockJev) void {
+        _ = unsetenv(@constCast(zenai.typesafe.env_var_name));
+        _ = unsetenv(@constCast(zenai.typesafe.base_url_env_var_name));
+    }
+};
+
+pub extern fn setenv(name: [*:0]u8, value: [*:0]u8, override: c_int) c_int;
+pub extern fn unsetenv(name: [*:0]u8) c_int;
 
 pub var test_config: Config = undefined;
 
@@ -519,6 +583,21 @@ test "tests:beforeAll" {
     log.opts.format = .pretty;
 
     const test_allocator = @import("root").tracking_allocator;
+
+    // Before App.init: its connection pool picks up the routes as it's built.
+    {
+        var wg: lp.WaitGroup = .{};
+        wg.startMany(2);
+
+        test_http_server = TestHTTPServer.init(test_routes.handle, 0);
+        test_http_server_thread = try std.Thread.spawn(.{}, TestHTTPServer.run, .{ &test_http_server.?, &wg });
+
+        test_ws_server = TestWSServer.init(0);
+        test_ws_server_thread = try std.Thread.spawn(.{}, TestWSServer.run, .{ &test_ws_server.?, &wg });
+
+        wg.wait();
+        try routeTestPorts();
+    }
 
     test_config = try Config.init(test_allocator, "test", .{
         .serve = .{
@@ -542,20 +621,31 @@ test "tests:beforeAll" {
 
     test_session = try test_browser.newSession(test_notification);
 
-    var wg: lp.WaitGroup = .{};
-    wg.startMany(3);
-
-    test_cdp_server_thread = try std.Thread.spawn(.{}, serveCDP, .{&wg});
-
-    test_http_server = TestHTTPServer.init(testHTTPHandler);
-    test_http_server_thread = try std.Thread.spawn(.{}, TestHTTPServer.run, .{ &test_http_server.?, &wg });
-
-    test_ws_server = TestWSServer.init();
-    test_ws_server_thread = try std.Thread.spawn(.{}, TestWSServer.run, .{ &test_ws_server.?, &wg });
-
-    // need to wait for the servers to be listening, else tests will fail because
+    // need to wait for the server to be listening, else tests will fail because
     // they aren't able to connect.
+    var wg: lp.WaitGroup = .{};
+    wg.start();
+    test_cdp_server_thread = try std.Thread.spawn(.{}, serveCDP, .{&wg});
     wg.wait();
+}
+
+/// Fixtures address the test servers by fixed ports, but each test process
+/// binds ephemeral ones so that several can run at once.
+fn routeTestPorts() !void {
+    const routes = [_]struct { u16, u16 }{
+        .{ 9582, testHttpPort() },
+        .{ 9584, test_ws_server.?.port },
+    };
+
+    var list: ?*libcurl.CurlSList = null;
+    errdefer libcurl.curl_slist_free_all(list);
+    for (routes) |route| {
+        const port, const real_port = route;
+        // an empty host matches any, so both 127.0.0.1 and localhost
+        const entry = try arena_allocator.printSentinel(":{d}:127.0.0.1:{d}", .{ port, real_port }, 0);
+        list = libcurl.curl_slist_append(list, entry) orelse return error.OutOfMemory;
+    }
+    http.test_connect_to = list;
 }
 
 test "tests:afterAll" {
@@ -594,677 +684,25 @@ test "tests:afterAll" {
     test_browser.deinit();
     test_notification.deinit();
     test_app.deinit();
+    // curl keeps the list, not a copy: free it once no handle is left
+    libcurl.curl_slist_free_all(http.test_connect_to);
+    http.test_connect_to = null;
     test_config.deinit(@import("root").tracking_allocator);
 }
 
 fn serveCDP(wg: *lp.WaitGroup) !void {
-    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 9583);
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
 
-    test_cdp_server = Server.init(test_app, address) catch |err| {
+    test_cdp_server = Server.init(test_app, .{ .ip = address }) catch |err| {
         std.debug.print("CDP server error: {}", .{err});
         return err;
     };
+
+    test_cdp_port = (try sys_net.boundAddress(test_cdp_server.?.listener)).getPort();
     test_cdp_server.?.protocols = .{ .cdp = true, .webdriver = true };
     wg.finish();
 
     test_cdp_server.?.run();
-}
-
-// /serve-count/ counters; only ever touched from the test HTTP server thread.
-var serve_counts = [_]struct { name: []const u8, count: u32 = 0 }{
-    .{ .name = "defer" },
-    .{ .name = "async" },
-    .{ .name = "dynamic" },
-    .{ .name = "prescan_blocking" },
-    .{ .name = "prescan_defer" },
-    .{ .name = "prescan_module" },
-};
-
-fn testHTTPHandler(req: *std.http.Server.Request) !void {
-    const path = req.head.target;
-
-    if (std.mem.eql(u8, path, "/xhr")) {
-        return req.respond("1234567890" ** 10, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/slow")) {
-        // Long enough for a timer scheduled by the requester to fire first.
-        lp.io.sleep(.fromMilliseconds(100), .awake) catch {};
-        return req.respond("slow", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr_empty")) {
-        return req.respond("", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    const xhr_xml_body = "<?xml version=\"1.0\"?><catalog><item id=\"a\"/><item id=\"b\"/><pubDate>2026</pubDate></catalog>";
-
-    if (std.mem.eql(u8, path, "/xhr/xml")) {
-        return req.respond(xhr_xml_body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/xml" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/xml_as_text")) {
-        return req.respond(xhr_xml_body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/json")) {
-        return req.respond("{\"over\":\"9000!!!\",\"updated_at\":1765867200000}", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/redirect")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "http://127.0.0.1:9582/xhr" },
-            },
-        });
-    }
-
-    // Scripts, so a cross-origin (localhost) load doesn't depend on CORS.
-    if (std.mem.eql(u8, path, "/resource-timing/tao")) {
-        return req.respond("window.__rt_tao = true;", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/javascript" },
-                .{ .name = "Timing-Allow-Origin", .value = "https://example.com, *" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/resource-timing/plain")) {
-        return req.respond("window.__rt_plain = true;", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/javascript" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/resource-timing/redirect")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/resource-timing/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect-no-fragment")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/redirect-target" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect-cross-origin-x-hop")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "http://localhost:9582/echo-x-hop" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/echo-x-hop")) {
-        var it = req.iterateHeaders();
-        var value: []const u8 = "NONE";
-        while (it.next()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "x-hop")) {
-                value = header.value;
-                break;
-            }
-        }
-        return req.respond(value, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect-target")) {
-        return req.respond("<!DOCTYPE html><title>landed</title>", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/303-no-location")) {
-        // 3xx WITHOUT a Location header: not a redirect, a final response
-        // whose body must be delivered (RFC 9110 §15.4).
-        return req.respond("<!DOCTYPE html><title>landed</title><p>see other body</p>", .{
-            .status = .see_other,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/300-with-location")) {
-        // A non-redirect 3xx (fetch's redirect statuses are only 301, 302,
-        // 303, 307 and 308) carrying a Location header: the header is a
-        // preference hint, not a redirect — the body must be delivered.
-        return req.respond("<!DOCTYPE html><title>choices</title><p>multiple choices body</p>", .{
-            .status = .multiple_choice,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-                .{ .name = "Location", .value = "http://127.0.0.1:9582/hi.html" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect-with-fragment")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/redirect-target#target_fragment" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/404")) {
-        return req.respond("Not Found", .{
-            .status = .not_found,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/src/browser/tests/401")) {
-        return req.respond("No", .{
-            .status = .unauthorized,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/404.js")) {
-        // Valid JS body served with a 404 status. Used to assert that
-        // ScriptManager does NOT execute the body of a failed script
-        // fetch — if it did, window.__404_body_executed would be set.
-        return req.respond("window.__404_body_executed = true;", .{
-            .status = .not_found,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/javascript" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/defer-marker.js")) {
-        // A deferred script body. Used by the regression test for a
-        // <script defer> whose completion is deferred by a later
-        // <link rel=stylesheet>'s synchronous fetch — it must still execute.
-        return req.respond("window.__deferRan = true;", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/javascript" },
-            },
-        });
-    }
-
-    if (std.mem.startsWith(u8, path, "/serve-count/") and std.mem.endsWith(u8, path, ".js")) {
-        // Serves `window.__serve_count_<name> = N;` where N counts how many
-        // times this URL has been served. Lets a fixture assert a preloaded
-        // script was fetched exactly once: the body the consumer executes
-        // carries N == 1, while a duplicate fetch would execute N == 2.
-        // no-store so the second fetch can't be satisfied by the HTTP cache.
-        const name = path["/serve-count/".len .. path.len - ".js".len];
-        const slot: *u32 = blk: {
-            for (&serve_counts) |*sc| {
-                if (std.mem.eql(u8, sc.name, name)) break :blk &sc.count;
-            }
-            return req.respond("unknown counter", .{ .status = .not_found });
-        };
-        slot.* += 1;
-        var buf: [64]u8 = undefined;
-        const body = try std.fmt.bufPrint(&buf, "window.__serve_count_{s} = {d};", .{ name, slot.* });
-        return req.respond(body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/javascript" },
-                .{ .name = "Cache-Control", .value = "no-store" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/500")) {
-        return req.respond("Internal Server Error", .{
-            .status = .internal_server_error,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/no_content_type")) {
-        return req.respond("untyped", .{});
-    }
-
-    if (std.mem.eql(u8, path, "/xhr/binary")) {
-        return req.respond(&.{ 0, 0, 1, 2, 0, 0, 9 }, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/octet-stream" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/sse/simple")) {
-        // A complete stream: default + custom event types, multi-line data,
-        // an id, and a comment. The connection closes right after; the test
-        // close()s before the (1s) reconnect fires.
-        return req.respond("retry: 1000\ndata: first\n\n: comment\nid: 42\nevent: custom\ndata: a\ndata: b\n\n", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/event-stream" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/stop_loading/streaming.html")) {
-        var send_buffer: [1024]u8 = undefined;
-        var res = try req.respondStreaming(&send_buffer, .{
-            .respond_options = .{
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-                },
-            },
-        });
-        try res.writer.writeAll("<html><body><p id=first>first</p>");
-        try res.writer.flush();
-        try res.flush();
-        lp.io.sleep(.fromMilliseconds(1500), .awake) catch {};
-        try res.writer.writeAll("<p id=second>second</p></body></html>");
-        try res.writer.flush();
-        return res.end();
-    }
-
-    if (std.mem.eql(u8, path, "/sse/streaming")) {
-        sse_flag.store(false, .release);
-        var send_buffer: [1024]u8 = undefined;
-        var res = try req.respondStreaming(&send_buffer, .{
-            .respond_options = .{
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/event-stream" },
-                },
-            },
-        });
-        try res.writer.writeAll("data: first\n\n");
-        try res.writer.flush();
-        try res.flush();
-
-        // Proof of progressive delivery: "second" is only sent once the
-        // client has reacted to "first" (by fetching /sse/flag), which it
-        // can only do if "first" was delivered while this response was
-        // still streaming.
-        var waited: usize = 0;
-        while (!sse_flag.load(.acquire) and waited < 5000) : (waited += 10) {
-            lp.io.sleep(.fromMilliseconds(10), .awake) catch {};
-        }
-        if (sse_flag.load(.acquire)) {
-            // split mid-line to exercise buffering across chunks
-            try res.writer.writeAll("data: sec");
-            try res.writer.flush();
-            try res.flush();
-            lp.io.sleep(.fromMilliseconds(20), .awake) catch {};
-            try res.writer.writeAll("ond\n\n");
-            try res.writer.flush();
-            try res.flush();
-        }
-        return res.end();
-    }
-
-    if (std.mem.eql(u8, path, "/sse/flag")) {
-        sse_flag.store(true, .release);
-        return req.respond("", .{});
-    }
-
-    if (std.mem.eql(u8, path, "/sse/reconnect")) {
-        if (sse_reconnect_hits.fetchAdd(1, .monotonic) == 0) {
-            return req.respond("retry: 10\ndata: one\n\n", .{
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/event-stream" },
-                },
-            });
-        }
-        return req.respond("data: two\n\n", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/event-stream" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/sse/long_retry")) {
-        return req.respond("retry: 60000\ndata: x\n\n", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/event-stream" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/sse/404")) {
-        return req.respond("data: x\n\n", .{
-            .status = .not_found,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/event-stream" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/sse/badmime")) {
-        return req.respond("data: x\n\n", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/styles/visibility.css")) {
-        // Used by css/external_stylesheet.html — drives the visibility
-        // cascade through StyleManager via Frame.loadExternalStylesheet
-        // so a `.ext-hide` element is observable to checkVisibility().
-        return req.respond(".ext-hide { display: none; }", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/css" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/styles/visibility2.css")) {
-        // Second visibility sheet used by the href-change regression test:
-        // mutating link.href must replace the cached sheet's rules in place,
-        // not append a new entry to document.styleSheets.
-        return req.respond(".ext-hide-2 { display: none; }", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/css" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/styles/404.css")) {
-        return req.respond("/* unused */", .{
-            .status = .not_found,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/css" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/styles/oversize.css")) {
-        // Body that exceeds Frame.MAX_STYLESHEET_BYTES (2 MiB) — written as a
-        // long sequence of valid declarations so the response itself parses
-        // fine and the error path is exercised by the size cap, not by a
-        // CSS parse failure.
-        const chunk = ".pad { color: #abcdef; } "; // 25 bytes
-        const repeats = (2 * 1024 * 1024 / chunk.len) + 1024;
-        var body = try std.ArrayList(u8).initCapacity(arena_allocator, chunk.len * repeats);
-        for (0..repeats) |_| body.appendSliceAssumeCapacity(chunk);
-        return req.respond(body.items, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/css" },
-            },
-        });
-    }
-
-    // Bodies are non-empty so that libcurl always reaches the write callback,
-    // which is where a headers_only request decides whether to drain or abort.
-    // ok.png takes the abort branch, small.png the drain branch; both must
-    // behave identically as far as the DOM is concerned.
-    if (std.mem.eql(u8, path, "/images/ok.png")) {
-        // > HttpClient.Request.HEADERS_ONLY_DRAIN_MAX
-        const body = try arena_allocator.alloc(u8, 16 * 1024 + 1);
-        @memset(body, 'x');
-        return req.respond(body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "image/png" },
-            },
-        });
-    }
-
-    // startsWith, not eql: a caller can append a query string to get distinct
-    // URLs (and so distinct transfers) off this one route.
-    if (std.mem.startsWith(u8, path, "/images/small.png")) {
-        const body = try arena_allocator.alloc(u8, 1024);
-        @memset(body, 'x');
-        return req.respond(body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "image/png" },
-            },
-        });
-    }
-
-    // No Content-Length: whether the body is small enough to drain can only
-    // be decided as it arrives.
-    if (std.mem.eql(u8, path, "/images/chunked.png")) {
-        var send_buffer: [1024]u8 = undefined;
-        var res = try req.respondStreaming(&send_buffer, .{
-            .respond_options = .{
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "image/svg+xml" },
-                },
-            },
-        });
-        try res.writer.writeAll("<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
-        try res.writer.flush();
-        return res.end();
-    }
-
-    if (std.mem.eql(u8, path, "/images/404.png")) {
-        return req.respond("not here", .{
-            .status = .not_found,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/images/500.png")) {
-        return req.respond("boom", .{
-            .status = .internal_server_error,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/images/redirect.png")) {
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/images/ok.png" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/echo_referer")) {
-        // Echo the request's Referer header back as HTML so tests can assert
-        // what Referer the navigation sent. Used by the cross-page Referer test.
-        var it = req.iterateHeaders();
-        var referer: []const u8 = "NONE";
-        while (it.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "Referer")) {
-                referer = h.value;
-                break;
-            }
-        }
-        var html_buf: [512]u8 = undefined;
-        const html = try std.fmt.bufPrint(&html_buf, "<html><body>referer={s}</body></html>", .{referer});
-        return req.respond(html, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/referer_link.html")) {
-        // Page with an anchor link to /echo_referer. The test clicks the link
-        // via JS and asserts the resulting page reports Referer = this page.
-        return req.respond(
-            "<html><body><a id=\"link\" href=\"/echo_referer\">go</a></body></html>",
-            .{
-                .extra_headers = &.{
-                    .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-                },
-            },
-        );
-    }
-
-    if (std.mem.eql(u8, path, "/echo_method")) {
-        // Echo the request method back as HTML so tests can assert on what
-        // method the navigation used. Used by the Page.reload-replays-POST test.
-        const method_name = @tagName(req.head.method);
-        var html_buf: [128]u8 = undefined;
-        const html = try std.fmt.bufPrint(&html_buf, "<html><body>method={s}</body></html>", .{method_name});
-        return req.respond(html, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/echo_body")) {
-        // Echo the request body back verbatim, so tests can assert on the bytes
-        // a request actually sent rather than just on its status.
-        var body_buf: [4096]u8 = undefined;
-        const body = if (req.head.method.requestHasBody())
-            try req.readerExpectNone(&body_buf).allocRemaining(arena_allocator, .limited(body_buf.len))
-        else
-            "";
-        return req.respond(body, .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/echo_headers")) {
-        // Echo every request header back as "name: value" lines, so tests
-        // can assert on the headers a request actually sent.
-        var buf: [8192]u8 = undefined;
-        var pos: usize = 0;
-        var it = req.iterateHeaders();
-        while (it.next()) |header| {
-            const line = try std.fmt.bufPrint(buf[pos..], "{s}: {s}\n", .{ header.name, header.value });
-            pos += line.len;
-        }
-        return req.respond(buf[0..pos], .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/set_cookie")) {
-        return req.respond("", .{
-            .extra_headers = &.{
-                .{ .name = "Set-Cookie", .value = "lp_hidden=1; Path=/set_cookie_scope" },
-                .{ .name = "X-Visible", .value = "yes" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect_same_echo_headers")) {
-        // Same-origin 302 to /echo_headers: Authorization must survive the hop.
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/echo_headers" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect_cross_echo_headers")) {
-        // 302 to /echo_headers on the localhost alias — a cross-origin hop, so
-        // Authorization must be stripped before the request is re-sent.
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "http://localhost:9582/echo_headers" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect_same_echo_referer")) {
-        // Same-origin 302 to /echo_referer: the full Referer must survive the hop.
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/echo_referer" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect_cross_echo_referer")) {
-        // 302 to /echo_referer on the localhost alias — a cross-origin hop, so
-        // the Referer must be recomputed at the redirect (stripped to origin
-        // under the default policy) rather than re-sent in full.
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "http://localhost:9582/echo_referer" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/redirect_to_echo")) {
-        // 302 to /echo_method. Used by the Page.reload-after-redirect test to
-        // confirm a POST→302→GET chain doesn't replay POST on reload.
-        return req.respond("", .{
-            .status = .found,
-            .extra_headers = &.{
-                .{ .name = "Location", .value = "/echo_method" },
-            },
-        });
-    }
-
-    if (std.mem.eql(u8, path, "/download/report.csv")) {
-        // A file download: Content-Disposition: attachment drives the
-        // Browser.setDownloadBehavior path (issue #2701).
-        return req.respond("col1,col2\nhello,world\n42,1337\n", .{
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "text/csv" },
-                .{ .name = "Content-Disposition", .value = "attachment; filename=\"report.csv\"" },
-            },
-        });
-    }
-
-    if (std.mem.startsWith(u8, path, "/src/browser/tests/")) {
-        if (std.mem.indexOf(u8, path, "delay_ms=")) |pos| {
-            const digits_start = pos + "delay_ms=".len;
-            var end = digits_start;
-            while (end < path.len and std.ascii.isDigit(path[end])) : (end += 1) {}
-            const delay_ms = std.fmt.parseInt(u64, path[digits_start..end], 10) catch 0;
-            lp.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
-        }
-        // strip off leading / so that it's relative to CWD
-        return TestHTTPServer.sendFile(req, path[1..]);
-    }
-
-    std.debug.print("TestHTTPServer was asked to serve an unknown file: {s}\n", .{path});
-
-    unreachable;
 }
 
 /// Declares the log lines a test expects to emit: one entry per line, so
@@ -1274,7 +712,7 @@ pub const expectLog = log.expectLog;
 /// Suppresses every line from `scopes` for the rest of the test.
 pub fn silenceLog(comptime scopes: []const log.Scope) void {
     inline for (scopes) |scope| {
-        log.opts.scope_enabled[@intFromEnum(scope)] = false;
+        log.opts.scope_enabled[@backingInt(scope)] = false;
     }
 }
 
@@ -1293,7 +731,7 @@ test "tests:afterEach" {
             continue;
         }
         failed = true;
-        const scope: log.Scope = @enumFromInt(i);
+        const scope: log.Scope = @fromBackingInt(@intCast(i));
         std.debug.print("expected {d} more {s} log line(s)\n", .{ count, @tagName(scope) });
     }
 

@@ -19,7 +19,6 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
-const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 
 const Node = @import("../Node.zig");
@@ -27,6 +26,8 @@ const Element = @import("../Element.zig");
 const TreeWalker = @import("../TreeWalker.zig");
 const Selector = @import("../selector/Selector.zig");
 const Form = @import("../element/html/Form.zig");
+const Table = @import("../element/html/Table.zig");
+const HTMLDocument = @import("../HTMLDocument.zig");
 
 const String = lp.String;
 
@@ -40,11 +41,14 @@ const Mode = enum {
     child_elements,
     child_tag,
     cells,
+    table_rows,
     select_options,
     selected_options,
     links,
     anchors,
     form,
+    listed,
+    document_named,
 };
 
 const ClassNameFilter = struct {
@@ -69,15 +73,18 @@ const Filters = union(Mode) {
     child_elements,
     child_tag: Element.Tag,
     cells,
+    table_rows,
     select_options,
     selected_options,
     links,
     anchors,
-    form: struct { form: *Form, form_id: ?[]const u8 },
+    form: struct { form: *Form, form_id: ?[]const u8, image_buttons: bool, outputs: bool, listed: bool },
+    listed,
+    document_named: []const u8,
 
     fn TypeOf(comptime mode: Mode) type {
         @setEvalBranchQuota(10_000);
-        return std.meta.fieldInfo(Filters, mode).type;
+        return @FieldType(Filters, @tagName(mode));
     }
 };
 
@@ -103,10 +110,11 @@ const Filters = union(Mode) {
 pub fn NodeLive(comptime mode: Mode) type {
     const Filter = Filters.TypeOf(mode);
     const TW = switch (mode) {
-        .tag, .tag_name, .tag_name_ns, .class_name, .name, .all_elements, .links, .anchors, .form => TreeWalker.FullExcludeSelf,
+        .tag, .tag_name, .tag_name_ns, .class_name, .name, .all_elements, .links, .anchors, .form, .listed, .document_named => TreeWalker.FullExcludeSelf,
         .child_elements, .child_tag, .cells => TreeWalker.Children,
-        // A select's options can sit one level down, inside an <optgroup>, so
-        // these two walk the subtree and filter on the parent instead.
+        .table_rows => Table.RowWalker,
+        // A select's options can sit anywhere below it, so these two walk the
+        // subtree and filter on the option's ancestors instead.
         .select_options, .selected_options => TreeWalker.FullExcludeSelf,
     };
     return struct {
@@ -133,7 +141,7 @@ pub fn NodeLive(comptime mode: Mode) type {
                 ._last_length = null,
                 ._filter = filter,
                 ._tw = TW.init(root, .{}),
-                ._cached_version = frame._page.dom_version,
+                ._cached_version = frame.page.dom_version,
             };
         }
 
@@ -205,8 +213,8 @@ pub fn NodeLive(comptime mode: Mode) type {
             return null;
         }
 
-        pub fn getByName(self: *Self, name: []const u8, frame: *Frame) ?*Element {
-            if (frame.getElementByIdFromNode(self._tw._root, name)) |element| {
+        pub fn getByName(self: *Self, name: []const u8) ?*Element {
+            if (Frame.getElementByIdFromNode(self._tw._root, name)) |element| {
                 const node = element.asNode();
                 if (self._tw.contains(node) and self.matches(node)) {
                     return element;
@@ -315,6 +323,8 @@ pub fn NodeLive(comptime mode: Mode) type {
                 .child_elements => return node._type == .element,
                 .child_tag => {
                     const el = node.is(Element) orelse return false;
+                    // getTag() is namespace-blind: an SVG "tr" reports .tr
+                    if (el._namespace != .html) return false;
                     return el.getTag() == self._filter;
                 },
                 .cells => {
@@ -322,23 +332,16 @@ pub fn NodeLive(comptime mode: Mode) type {
                     const el = node.is(Element) orelse return false;
                     return el.is(Element.Html.TableCell) != null;
                 },
+                // the RowWalker only yields rows
+                .table_rows => return true,
                 .select_options, .selected_options => {
                     const opt = node.is(Element.Html.Option) orelse return false;
 
-                    // we have an option, but it's only a match IF
-                    // 1 - this is a direct child of the root (i.e. the <select>)
-                    // OR
-                    // 2 - this is a direct child of an <optgroup> which, itself
-                    //     is a direct child of the root (i.e. the <select>)
-
+                    // only if it's in the root <select>'s list of options
                     const parent = node.parentNode() orelse return false;
-                    if (parent == self._tw._root) {
-                        // case 1: it _is_ a direct child of the root
-                    } else {
-                        if (parent.is(Element.Html.OptGroup) == null or parent.parentNode() != self._tw._root) {
-                            return false;
-                        }
-                        // the parent is an optgroup and its parent is the root
+                    const pos = Element.Html.Select.listPosition(parent) orelse return false;
+                    if (pos.select.asNode() != self._tw._root) {
+                        return false;
                     }
 
                     return if (comptime mode == .selected_options) opt.getSelected() else true;
@@ -359,8 +362,23 @@ pub fn NodeLive(comptime mode: Mode) type {
                 },
                 .form => {
                     const el = node.is(Element) orelse return false;
-                    if (!isFormControl(el)) {
+                    if (el._type != .html) {
                         return false;
+                    }
+                    const is_control = isFormControl(el) or switch (el.getTag()) {
+                        .output => self._filter.outputs or self._filter.listed,
+                        .fieldset, .object => self._filter.listed,
+                        else => false,
+                    };
+                    if (is_control == false) {
+                        return false;
+                    }
+                    if (self._filter.image_buttons == false) {
+                        if (el.is(Element.Html.Input)) |input| {
+                            if (input._input_type == .image) {
+                                return false;
+                            }
+                        }
                     }
 
                     if (self._filter.form_id) |form_id| {
@@ -389,20 +407,34 @@ pub fn NodeLive(comptime mode: Mode) type {
                     // controls, this could be significantly faster.
                     return self._filter.form.asNode().contains(node);
                 },
+                .listed => {
+                    const el = node.is(Element) orelse return false;
+                    if (el._type != .html) {
+                        return false;
+                    }
+                    return isFormControl(el) or switch (el.getTag()) {
+                        .output, .fieldset, .object => true,
+                        else => false,
+                    };
+                },
+                .document_named => {
+                    const el = node.is(Element) orelse return false;
+                    return HTMLDocument.isNamed(el, self._filter);
+                },
             }
         }
 
         fn isFormControl(el: *Element) bool {
-            if (el._type != .html) return false;
             const html = el.subtype(Element.Html);
             return switch (html._type) {
                 .input, .button, .select, .textarea => true,
+                .custom => html.subtype(Element.Html.Custom).isFormAssociated(),
                 else => false,
             };
         }
 
         fn versionCheck(self: *Self, frame: *const Frame) bool {
-            const current = frame._page.dom_version;
+            const current = frame.page.dom_version;
             if (current == self._cached_version) {
                 return true;
             }
@@ -435,11 +467,14 @@ pub fn NodeLive(comptime mode: Mode) type {
                 .child_elements => .{ ._data = .{ .child_elements = self } },
                 .child_tag => .{ ._data = .{ .child_tag = self } },
                 .cells => .{ ._data = .{ .cells = self } },
+                .table_rows => .{ ._data = .{ .table_rows = self } },
                 .select_options => .{ ._data = .{ .select_options = self } },
                 .selected_options => .{ ._data = .{ .selected_options = self } },
                 .links => .{ ._data = .{ .links = self } },
                 .anchors => .{ ._data = .{ .anchors = self } },
                 .form => .{ ._data = .{ .form = self } },
+                .listed => .{ ._data = .{ .listed = self } },
+                .document_named => .{ ._data = .{ .document_named = self } },
             };
         }
     };
@@ -480,7 +515,7 @@ test "NodeLive: indexed reads stay linear" {
 
 fn buildSpans(frame: *Frame, count: usize) !*Node {
     const div = try frame.window._document.createElement("div", null, frame);
-    const html = try frame.arena.alloc(u8, count * "<span></span>".len);
+    const html = try frame.page_arena.alloc(u8, count * "<span></span>".len);
     var i: usize = 0;
     while (i < html.len) : (i += "<span></span>".len) {
         @memcpy(html[i..][0.."<span></span>".len], "<span></span>");

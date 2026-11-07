@@ -23,6 +23,7 @@ const Frame = @import("../Frame.zig");
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
 const ShadowRoot = @import("ShadowRoot.zig");
+const Template = @import("element/html/Template.zig");
 const collections = @import("collections.zig");
 const Selector = @import("selector/Selector.zig");
 
@@ -32,6 +33,7 @@ pub const Proto = Node;
 
 _type: Type,
 _proto: *Node,
+_template: ?*Template = null,
 
 pub const Type = union(enum) {
     generic,
@@ -54,11 +56,18 @@ pub fn as(self: *DocumentFragment, comptime T: type) *T {
     return self.is(T).?;
 }
 
-pub fn init(frame: *Frame) !*DocumentFragment {
-    return frame._factory.node(DocumentFragment{
+pub fn init(document: *const Node.Document, frame: *Frame) !*DocumentFragment {
+    return frame._factory.node(document, DocumentFragment{
         ._type = .generic,
         ._proto = undefined,
     });
+}
+
+pub fn getHost(self: *const DocumentFragment) ?*Element {
+    return switch (self._type) {
+        .shadow_root => |shadow_root| shadow_root._host,
+        .generic => if (self._template) |template| template.asElement() else null,
+    };
 }
 
 pub fn asNode(self: *DocumentFragment) *Node {
@@ -126,26 +135,26 @@ fn getChildElementCount(self: *DocumentFragment) usize {
     return count;
 }
 
-pub fn append(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn append(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const parent = self.asNode();
-    for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(frame);
+    for (nodes.values) |node_or_text| {
+        const child = try node_or_text.toNode(parent.getDocument(frame));
         _ = try parent.appendChild(child, frame);
     }
 }
 
-pub fn prepend(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn prepend(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const parent = self.asNode();
-    var i = nodes.len;
+    var i = nodes.values.len;
     while (i > 0) {
         i -= 1;
-        const child = try nodes[i].toNode(frame);
+        const child = try nodes.values[i].toNode(parent.getDocument(frame));
         _ = try parent.insertBefore(child, parent.firstChild(), frame);
     }
 }
 
-pub fn replaceChildren(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    return self.asNode().replaceChildren(nodes, frame);
+pub fn replaceChildren(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceChildren(nodes.values, frame);
 }
 
 pub fn moveBefore(self: *DocumentFragment, node: js.Value, child: js.Value, frame: *Frame) !void {
@@ -165,23 +174,12 @@ pub fn setInnerHTML(self: *DocumentFragment, html: []const u8, frame: *Frame) !v
     return parent.setHTML(html, .{}, frame);
 }
 
-/// allows declarative shadow dom
-pub fn setHTMLUnsafe(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
-    const parent = self.asNode();
-    return parent.setHTML(html, .{ .allow_declarative_shadow = true }, frame);
-}
-
-pub fn cloneFragment(self: *DocumentFragment, deep: bool, frame: *Frame) !*Node {
-    const fragment = try DocumentFragment.init(frame);
+pub fn cloneFragment(self: *DocumentFragment, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {
+    const fragment = try DocumentFragment.init(document, frame);
     const fragment_node = fragment.asNode();
 
     if (deep) {
-        var child_it = self.asNode().childrenIterator();
-        while (child_it.next()) |child| {
-            if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
-                try frame.appendNode(fragment_node, cloned_child, .{});
-            }
-        }
+        try self.asNode().cloneChildrenInto(fragment_node, document, frame);
     }
 
     return fragment_node;
@@ -192,11 +190,13 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DocumentFragment";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const constructor = bridge.constructor(DocumentFragment.init, .{});
+    pub const constructor = bridge.constructor(_constructor, .{});
+    fn _constructor(frame: *Frame) !*DocumentFragment {
+        return init(frame.document, frame);
+    }
 
     pub const getElementById = bridge.function(_getElementById, .{});
     fn _getElementById(self: *DocumentFragment, value_: ?js.Value) !?*Element {
@@ -220,17 +220,6 @@ pub const JsApi = struct {
     pub const prepend = bridge.function(DocumentFragment.prepend, .{ .ce_reactions = true });
     pub const moveBefore = bridge.function(DocumentFragment.moveBefore, .{ .ce_reactions = true });
     pub const replaceChildren = bridge.function(DocumentFragment.replaceChildren, .{ .ce_reactions = true });
-
-    pub const innerHTML = bridge.accessor(_getInnerHTML, _setInnerHTML, .{ .ce_reactions = true });
-    fn _getInnerHTML(self: *DocumentFragment, frame: *Frame) ![]const u8 {
-        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
-        try self.getInnerHTML(&buf.writer, frame);
-        return buf.written();
-    }
-    fn _setInnerHTML(self: *DocumentFragment, value: js.Value, frame: *Frame) !void {
-        // `[LegacyNullToEmptyString] DOMString`: a JS null becomes "", not "null".
-        return self.setInnerHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
-    }
 };
 
 const testing = @import("../../testing.zig");

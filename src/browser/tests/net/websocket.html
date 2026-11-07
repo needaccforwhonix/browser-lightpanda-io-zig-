@@ -178,6 +178,37 @@
 }
 </script>
 
+<script id=receive_fragmented type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+  ws.binaryType = 'arraybuffer';
+
+  ws.addEventListener('open', () => {
+    ws.send('send-fragmented');
+  });
+
+  ws.addEventListener('message', (e) => {
+    if (typeof e.data === 'string') {
+      received.push(e.data);
+      if (e.data === 'end') ws.close();
+    } else {
+      received.push(Array.from(new Uint8Array(e.data)));
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual([[1, 2, 3], 'abcd', 'end'], received);
+  });
+}
+</script>
+
 <script id=send_large type=module>
 {
   const state = await testing.async();
@@ -737,7 +768,7 @@
 <script id=cookies_on_upgrade_samesite_strict type=module>
 {
   // SameSite=Strict on a same-site upgrade (origin and target share
-  // host 127.0.0.1) MUST attach. The patch passes is_navigation=false;
+  // host 127.0.0.1) MUST attach. The upgrade is a .subresource lookup;
   // the cookie jar's SameSite logic only blocks Strict cookies when
   // the request is cross-site, regardless of navigation status. This
   // test pins the same-site path so a regression that breaks same-site
@@ -842,6 +873,191 @@
     // The origin is the document's (fixture HTTP server, port 9582) —
     // not the WS endpoint's 9584.
     testing.expectEqual(['origin:http://127.0.0.1:9582'], received);
+  });
+}
+</script>
+
+<script id=send_non_buffer_object type=module>
+{
+  const state = await testing.async();
+  let received = [];
+
+  let ws = new WebSocket('ws://127.0.0.1:9584/');
+
+  ws.addEventListener('open', () => {
+    // Anything that isn't a buffer is sent as its string, iterable or not
+    ws.send(new Set([1]));
+    ws.send([1, 2]);
+  });
+
+  ws.addEventListener('message', (e) => {
+    received.push(e.data);
+    if (received.length === 2) {
+      ws.close();
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['echo-[object Set]', 'echo-1,2'], received);
+  });
+}
+</script>
+
+<script id=protocols>
+{
+  // `optional (DOMString or sequence<DOMString>) protocols`
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', 'a b'));
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', ['ok', 'a b']));
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', new Set(['a b'])));
+  testing.expectEqual(1, WebSocket.length);
+
+  // A value that occurs more than once throws, including when the copies are
+  // not adjacent. Distinct values still construct.
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', ['dup', 'dup']));
+  testing.expectError('SyntaxError', () => new WebSocket('ws://127.0.0.1:9584/', ['a', 'b', 'a']));
+  new WebSocket('ws://127.0.0.1:9584/', ['a', 'b']).close();
+}
+</script>
+
+<script id=server_subprotocol_match type=module>
+// Matching subprotocol selected by the server: connection succeeds and ws.protocol is set
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/?protocol=chat', ['chat', 'superchat']);
+
+  ws.addEventListener('open', () => {
+    events.push('open');
+    events.push(ws.protocol);
+    ws.close();
+  });
+  ws.addEventListener('close', () => {
+    events.push('close');
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['open', 'chat', 'close'], events);
+  });
+}
+</script>
+
+<script id=server_subprotocol_unrequested type=module>
+// Server selects an unrequested subprotocol: connection fails (RFC 6455 §4.1)
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/?protocol=unrequested', ['chat']);
+
+  ws.addEventListener('open', () => { events.push('open'); });
+  ws.addEventListener('error', () => { events.push('error'); });
+  ws.addEventListener('close', (e) => {
+    events.push('close');
+    events.push(e.code);
+    events.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['error', 'close', 1006, false], events);
+    testing.expectEqual('', ws.protocol);
+  });
+}
+</script>
+
+<script id=server_subprotocol_unsolicited type=module>
+// Server returns a subprotocol when the client requested none: connection fails
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/?protocol=unsolicited');
+
+  ws.addEventListener('open', () => { events.push('open'); });
+  ws.addEventListener('error', () => { events.push('error'); });
+  ws.addEventListener('close', (e) => {
+    events.push('close');
+    events.push(e.code);
+    events.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['error', 'close', 1006, false], events);
+    testing.expectEqual('', ws.protocol);
+  });
+}
+</script>
+
+<script id=server_subprotocol_multiple type=module>
+// Server returns multiple Sec-WebSocket-Protocol headers: connection fails
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/?multiple-protocols=true', ['proto1', 'proto2']);
+
+  ws.addEventListener('open', () => { events.push('open'); });
+  ws.addEventListener('error', () => { events.push('error'); });
+  ws.addEventListener('close', (e) => {
+    events.push('close');
+    events.push(e.code);
+    events.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['error', 'close', 1006, false], events);
+    testing.expectEqual('', ws.protocol);
+  });
+}
+</script>
+
+<script id=server_subprotocol_missing type=module>
+// Client offered subprotocols but the server picked none: connection fails
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/', ['chat']);
+
+  ws.addEventListener('open', () => { events.push('open'); });
+  ws.addEventListener('error', () => { events.push('error'); });
+  ws.addEventListener('close', (e) => {
+    events.push('close');
+    events.push(e.code);
+    events.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['error', 'close', 1006, false], events);
+    testing.expectEqual('', ws.protocol);
+  });
+}
+</script>
+
+<script id=server_subprotocol_empty type=module>
+// Server sends an empty Sec-WebSocket-Protocol header when the client
+// requested none: connection fails
+{
+  const state = await testing.async();
+  let events = [];
+  let ws = new WebSocket('ws://127.0.0.1:9584/?protocol=');
+
+  ws.addEventListener('open', () => { events.push('open'); });
+  ws.addEventListener('error', () => { events.push('error'); });
+  ws.addEventListener('close', (e) => {
+    events.push('close');
+    events.push(e.code);
+    events.push(e.wasClean);
+    state.resolve();
+  });
+
+  await state.done(() => {
+    testing.expectEqual(['error', 'close', 1006, false], events);
+    testing.expectEqual('', ws.protocol);
   });
 }
 </script>

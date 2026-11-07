@@ -80,7 +80,9 @@ const EventListeners = struct {
     frame_navigate_failed: List = .{},
     frame_network_idle: List = .{},
     frame_network_almost_idle: List = .{},
+    frame_settled: List = .{},
     frame_child_frame_created: List = .{},
+    frame_child_frame_detached: List = .{},
     frame_dom_content_loaded: List = .{},
     frame_loaded: List = .{},
     http_request_fail: List = .{},
@@ -88,17 +90,20 @@ const EventListeners = struct {
     http_request_intercept: List = .{},
     http_request_done: List = .{},
     http_request_auth_required: List = .{},
+    http_response_intercept: List = .{},
     http_request_served_from_cache: List = .{},
     http_response_data: List = .{},
     http_response_header_done: List = .{},
     javascript_dialog_opening: List = .{},
     console_message: List = .{},
     runtime_console_message: List = .{},
+    exception_thrown: List = .{},
     model_context_tool_added: List = .{},
     model_context_tool_removed: List = .{},
     cookie_changed: List = .{},
     download_will_begin: List = .{},
     download_progress: List = .{},
+    download_data: List = .{},
 };
 
 const Events = union(enum) {
@@ -111,13 +116,16 @@ const Events = union(enum) {
     frame_navigate_failed: *const FrameNavigateFailed,
     frame_network_idle: *const FrameNetworkIdle,
     frame_network_almost_idle: *const FrameNetworkAlmostIdle,
+    frame_settled: *const FrameSettled,
     frame_child_frame_created: *const FrameChildFrameCreated,
+    frame_child_frame_detached: *const FrameChildFrameDetached,
     frame_dom_content_loaded: *const FrameDOMContentLoaded,
     frame_loaded: *const FrameLoaded,
     http_request_fail: *const RequestFail,
     http_request_start: *const RequestStart,
     http_request_intercept: *const RequestIntercept,
     http_request_auth_required: *const RequestAuthRequired,
+    http_response_intercept: *const ResponseIntercept,
     http_request_served_from_cache: *const RequestServedFromCache,
     http_request_done: *const RequestDone,
     http_response_data: *const ResponseData,
@@ -125,15 +133,20 @@ const Events = union(enum) {
     javascript_dialog_opening: *const JavascriptDialogOpening,
     console_message: *const ConsoleMessage,
     runtime_console_message: *const ConsoleMessage,
+    exception_thrown: *const ExceptionThrown,
     model_context_tool_added: *const ModelContextToolEvent,
     model_context_tool_removed: *const ModelContextToolEvent,
     cookie_changed: *const CookieChanged,
     download_will_begin: *const DownloadWillBegin,
     download_progress: *const DownloadProgress,
+    download_data: *const DownloadData,
 };
 pub const EventType = std.meta.FieldEnum(Events);
 
-pub const FrameRemove = struct {};
+pub const FrameRemove = struct {
+    // Root frame id of the Page being removed.
+    frame_id: u32,
+};
 
 pub const FrameNavigate = struct {
     req_id: u32,
@@ -202,11 +215,23 @@ pub const FrameNetworkAlmostIdle = struct {
     timestamp: u64,
 };
 
+pub const FrameSettled = struct {
+    req_id: u32,
+    frame_id: u32,
+    loader_id: u32,
+    timestamp: u64,
+};
+
 pub const FrameChildFrameCreated = struct {
     frame_id: u32,
     loader_id: u32,
     parent_id: u32,
     timestamp: u64,
+};
+
+pub const FrameChildFrameDetached = struct {
+    frame_id: u32,
+    parent_id: u32,
 };
 
 pub const FrameDOMContentLoaded = struct {
@@ -238,6 +263,12 @@ pub const RequestAuthRequired = struct {
     wait_for_interception: *bool,
 };
 
+// A final response or a redirect which has not be delivered to its consumer yet.
+pub const ResponseIntercept = struct {
+    transfer: *Transfer,
+    wait_for_interception: *bool,
+};
+
 pub const ResponseData = struct {
     data: []const u8,
     transfer: *Transfer,
@@ -249,7 +280,7 @@ pub const ResponseHeaderDone = struct {
 
 pub const RequestDone = struct {
     transfer: *Transfer,
-    content_length: usize,
+    encoded_data_length: usize,
 };
 
 pub const RequestFail = struct {
@@ -267,6 +298,7 @@ pub const RequestServedFromCache = struct {
 };
 
 pub const JavascriptDialogOpening = struct {
+    frame_id: u32,
     url: [:0]const u8,
     message: []const u8,
     dialog_type: []const u8,
@@ -310,10 +342,12 @@ pub const DownloadWillBegin = struct {
     guid: []const u8,
     url: []const u8,
     suggested_filename: []const u8,
+    // The response's Content-Type, if it had one.
+    content_type: ?[]const u8,
 };
 
-// Emitted by Frame as a download is written to disk: once when it starts
-// (`.in_progress`) and once when the body is fully written (`.completed`).
+// Emitted by Download: once when it starts (`.in_progress`) and once when it
+// ends (`.completed`, or `.canceled` if it failed).
 // The CDP browser domain turns this into a `Browser.downloadProgress` event.
 pub const DownloadProgress = struct {
     guid: []const u8,
@@ -326,6 +360,11 @@ pub const DownloadProgress = struct {
         completed,
         canceled,
     };
+};
+
+pub const DownloadData = struct {
+    guid: []const u8,
+    data: []const u8,
 };
 
 pub const DialogResponse = struct {
@@ -349,6 +388,8 @@ pub const ConsoleMessageType = enum {
 };
 
 pub const ConsoleMessage = struct {
+    // The frame the message was logged in (a worker's is its owner's).
+    frame_id: u32,
     timestamp: u64,
     source: enum {
         xml,
@@ -364,10 +405,25 @@ pub const ConsoleMessage = struct {
         worker,
     },
     type: ConsoleMessageType,
-    values: []js.Value,
+    values: []const js.Value,
+    // The caller's: the context the message was logged in.
+    local: *const js.Local,
     url: ?[]const u8 = null,
     line: ?u32 = null,
     columns: ?u32 = null,
+};
+
+// An uncaught exception reported to a window and not cancelled by an "error"
+// listener, or a promise rejection still unhandled at the end of a microtask
+// checkpoint and not cancelled by an "unhandledrejection" listener: what
+// Chrome logs as "Uncaught …" or "Uncaught (in promise) …" and sends as
+// Runtime.exceptionThrown.
+pub const ExceptionThrown = struct {
+    frame_id: u32,
+    timestamp: u64,
+    value: js.Value,
+    location: js.Value.ErrorLocation,
+    kind: enum { exception, rejection } = .exception,
 };
 
 pub fn init(allocator: Allocator) !*Notification {
@@ -484,12 +540,7 @@ pub fn dispatch(self: *Notification, comptime event: EventType, data: ArgType(ev
 
 // Given an event type enum, returns the type of arg the event emits
 pub fn ArgType(comptime event: Notification.EventType) type {
-    inline for (std.meta.fields(Notification.Events)) |f| {
-        if (std.mem.eql(u8, f.name, @tagName(event))) {
-            return f.type;
-        }
-    }
-    unreachable;
+    return @FieldType(Notification.Events, @tagName(event));
 }
 
 // Given an event type enum, returns the listening function type

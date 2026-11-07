@@ -100,30 +100,8 @@ fn writeReference(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 fn writeRow(w: *std.Io.Writer, s: *const Schema) std.Io.Writer.Error!void {
     try w.writeAll("| `");
-    if (s.tool.isAsync()) try w.writeAll("await ");
-    try w.print("page.{s}(", .{s.tool_name});
-    for (s.positional, 0..) |p, i| {
-        const optional = positionalOptional(s, p);
-        // A trailing optional positional is bracketed; a leading one
-        // (press's selector) renders plain and its note explains `null`.
-        if (i > 0) try w.writeAll(if (optional) "[, " else ", ");
-        try w.writeAll(p);
-        if (i > 0 and optional) try w.writeAll("]");
-    }
-    // The script form of extract takes the schema as its only argument
-    // (`Runtime.extractArgs`); every other tool accepts the options object.
-    if (s.tool != .extract and hasOptions(s)) {
-        try w.writeAll(if (s.positional.len > 0) "[, { " else "[{ ");
-        var i: usize = 0;
-        for (s.fields) |f| {
-            if (!isOption(s, f.name)) continue;
-            if (i > 0) try w.writeAll(", ");
-            try w.writeAll(f.name);
-            i += 1;
-        }
-        try w.writeAll(" }]");
-    }
-    try w.writeAll(")` | ");
+    try writeSignature(w, s);
+    try w.writeAll("` | ");
 
     var wrote = false;
     if (s.tool.isAsync()) {
@@ -154,6 +132,35 @@ fn writeRow(w: *std.Io.Writer, s: *const Schema) std.Io.Writer.Error!void {
         wrote = true;
     }
     try w.writeAll(" |\n");
+}
+
+/// The script call `await page.tool(positional…[, { option… }])`, as the
+/// runtime marshals it.
+pub fn writeSignature(w: *std.Io.Writer, s: *const Schema) std.Io.Writer.Error!void {
+    if (s.tool.isAsync()) try w.writeAll("await ");
+    try w.print("page.{s}(", .{s.tool_name});
+    for (s.positional, 0..) |p, i| {
+        const optional = positionalOptional(s, p);
+        // A trailing optional positional is bracketed; a leading one
+        // (press's selector) renders plain and its note explains `null`.
+        if (i > 0) try w.writeAll(if (optional) "[, " else ", ");
+        try w.writeAll(p);
+        if (i > 0 and optional) try w.writeAll("]");
+    }
+    // The script form of extract takes the schema as its only argument
+    // (`Runtime.extractArgs`); every other tool accepts the options object.
+    if (s.tool != .extract and hasOptions(s)) {
+        try w.writeAll(if (s.positional.len > 0) "[, { " else "[{ ");
+        var i: usize = 0;
+        for (s.fields) |f| {
+            if (!isOption(s, f.name)) continue;
+            if (i > 0) try w.writeAll(", ");
+            try w.writeAll(f.name);
+            i += 1;
+        }
+        try w.writeAll(" }]");
+    }
+    try w.writeAll(")");
 }
 
 /// Non-positional schema fields surfacing in the script signature.
@@ -197,13 +204,19 @@ fn note(tool: browser_tools.Tool) []const u8 {
         .goto => "Navigates the page (re-navigating reuses the same object). Waits for `load`. Rejects on navigation failure; a **timeout does NOT reject** (the page may still be usable). Default timeout 10000 ms.",
         .evaluate => "Page-side JS escape hatch; returns text (JSON for objects/arrays).",
         .extract => "The only primitive returning a real JS value (object/array). The schema is its only argument. See schema below.",
+        .classify => "Classifies page state or candidate elements via TypeSafe Jev: an array of categories, or an object of presets and questions. Replay calls Jev live and needs `TYPESAFE_API_KEY`.",
         .waitForSelector => "`waitFor*` default timeout 5000 ms.",
         .waitForScript => "Re-evaluates page JS until truthy.",
         .waitForState => "",
         .screenshot => "`path` is required: writes a PNG of the text layout.",
+        .download => "Sends the session's cookies, so authenticated downloads work. Nothing is written unless the status is 200-203, and a failed download leaves `path` as it was.",
         .press => "Selector first! `page.press(\"Enter\")` binds \"Enter\" to `selector` and fails — use `page.press(null, \"Enter\")` or `page.press({ key: \"Enter\" })`.",
         .click, .fill, .scroll, .hover, .selectOption, .setChecked => "",
-        .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .findElement, .consoleLogs, .getUrl, .getCookies, .getEnv => "",
+        .acceptCookies => "Clicks the consent control Jev picks, then re-reads the page to check the banner went. Pass the `selectors` from an earlier result to click them with no model call; otherwise needs `TYPESAFE_API_KEY`.",
+        .login => "Fills the sign-in fields Jev picks and submits. Credentials go in as `$LP_*` placeholders. Pass the `*Selector` fields from an earlier result to replay with no model call; otherwise needs `TYPESAFE_API_KEY`.",
+        .findElement => "`name` is a case-insensitive substring, or a JS regex literal like `/sign (in|up)/` (also case-insensitive).",
+        .callPageTool => "Runs a tool the page registered through WebMCP; returns its text result.",
+        .search, .markdown, .html, .links, .tree, .nodeDetails, .interactiveElements, .structuredData, .detectForms, .consoleLogs, .getUrl, .getCookies, .getEnv, .popups, .pageTools => "",
     };
 }
 
@@ -328,25 +341,25 @@ test "skill: every recorded tool is documented, no non-recorded one is" {
     const body = text();
     inline for (comptime std.meta.tags(browser_tools.Tool)) |tool| {
         const call = "page." ++ @tagName(tool) ++ "(";
-        const documented = std.mem.indexOf(u8, body, call) != null;
+        const documented = std.mem.find(u8, body, call) != null;
         try testing.expect(documented == tool.isRecorded());
     }
-    try testing.expect(std.mem.indexOf(u8, body, "await page.goto(") != null);
+    try testing.expect(std.mem.find(u8, body, "await page.goto(") != null);
 }
 
 test "skill: golden fragments track the schemas" {
     const body = text();
     // waitForState's enum list tracks Config.WaitUntil.
     inline for (comptime std.meta.tags(lp.Config.WaitUntil)) |state| {
-        try testing.expect(std.mem.indexOf(u8, body, "\"" ++ @tagName(state) ++ "\"") != null);
+        try testing.expect(std.mem.find(u8, body, "\"" ++ @tagName(state) ++ "\"") != null);
     }
-    try testing.expect(std.mem.indexOf(u8, body, "`checked` defaults to `true`.") != null);
+    try testing.expect(std.mem.find(u8, body, "`checked` defaults to `true`.") != null);
     // extract's script form takes the schema as its only argument.
-    try testing.expect(std.mem.indexOf(u8, body, "page.extract(schema)") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "page.extract(schema[, ") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "{ url, timeout, save }") != null);
+    try testing.expect(std.mem.find(u8, body, "page.extract(schema)") != null);
+    try testing.expect(std.mem.find(u8, body, "page.extract(schema[, ") == null);
+    try testing.expect(std.mem.find(u8, body, "{ url, timeout, save }") != null);
     // backendNodeId has no script form.
-    try testing.expect(std.mem.indexOf(u8, body, "backendNodeId }") == null);
+    try testing.expect(std.mem.find(u8, body, "backendNodeId }") == null);
 }
 
 test "skill: write emits frontmatter" {
@@ -354,5 +367,5 @@ test "skill: write emits frontmatter" {
     defer aw.deinit();
     try write(&aw.writer);
     try testing.expect(std.mem.startsWith(u8, aw.written(), "---\nname: pandascript\ndescription: "));
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\n---\n\n# Writing Lightpanda agent scripts\n") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\n---\n\n# Writing Lightpanda agent scripts\n") != null);
 }

@@ -1,5 +1,5 @@
 /.zig-cache/
-/.lp-cache/
+/.lp-cache
 /.lp-history
 /.lp-history.js
 /.lp-agent.zon
@@ -8,3 +8,4 @@ zig-out
 lightpanda.id
 /src/rust/target/
 src/snapshot.bin
+result

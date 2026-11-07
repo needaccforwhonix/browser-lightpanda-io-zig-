@@ -72,7 +72,7 @@ pub fn postTask(self: *Scheduler, cb: js.Function.Global, options_: ?js.Value, e
     if (opts.signal) |signal| {
         if (signal._aborted) {
             cb.release();
-            rejectWithReason(resolver, signal._reason, local);
+            AbortSignal.rejectWithReason(resolver, "scheduler task abort", signal._reason);
             return resolver.promise();
         }
     }
@@ -92,7 +92,7 @@ pub fn postTask(self: *Scheduler, cb: js.Function.Global, options_: ?js.Value, e
     task.resolver = try resolver.persist();
     task.state = .{ .priority = priority, .signal = opts.signal };
     if (opts.signal) |signal| {
-        try signal._dependents.append(exec.arena, .{ .scheduler_task = task });
+        try signal._dependents.append(exec.page_arena, .{ .scheduler_task = task });
     }
     try exec.js.scheduler.add(task, Task.run, opts.delay orelse 0, .{
         .name = "scheduler.postTask",
@@ -108,7 +108,7 @@ pub fn yield(self: *Scheduler, exec: *js.Execution) !js.Promise {
     const state = self._current orelse TaskState{ .priority = .@"user-visible", .signal = null };
     if (state.signal) |signal| {
         if (signal._aborted) {
-            rejectWithReason(resolver, signal._reason, local);
+            AbortSignal.rejectWithReason(resolver, "scheduler task abort", signal._reason);
             return resolver.promise();
         }
     }
@@ -119,7 +119,7 @@ pub fn yield(self: *Scheduler, exec: *js.Execution) !js.Promise {
     task.resolver = try resolver.persist();
     task.state = state;
     if (state.signal) |signal| {
-        try signal._dependents.append(exec.arena, .{ .scheduler_task = task });
+        try signal._dependents.append(exec.page_arena, .{ .scheduler_task = task });
     }
     try exec.js.scheduler.add(task, Task.run, 0, .{
         .name = "scheduler.yield",
@@ -127,14 +127,6 @@ pub fn yield(self: *Scheduler, exec: *js.Execution) !js.Promise {
         .finalizer = Task.finalize,
     });
     return resolver.promise();
-}
-
-fn rejectWithReason(resolver: js.PromiseResolver, reason: AbortSignal.Reason, local: *const js.Local) void {
-    const value = AbortSignal.reasonJsValue(reason, local) catch {
-        resolver.rejectError("scheduler task abort", .{ .dom_exception = .{ .err = error.AbortError } });
-        return;
-    };
-    resolver.reject("scheduler task abort", value);
 }
 
 pub const Task = struct {
@@ -151,7 +143,7 @@ pub const Task = struct {
 
     fn create(signal: ?*AbortSignal, exec: *js.Execution) !*Task {
         if (signal != null) {
-            const task = try exec.arena.create(Task);
+            const task = try exec.page_arena.create(Task);
             task.exec = exec;
             task.arena = null;
             return task;
@@ -260,7 +252,7 @@ pub const Task = struct {
         var ls: js.Local.Scope = undefined;
         exec.js.localScope(&ls);
         defer ls.deinit();
-        rejectWithReason(resolver_global.local(&ls.local), reason, &ls.local);
+        AbortSignal.rejectWithReason(resolver_global.local(&ls.local), "scheduler task abort", reason);
     }
 };
 
@@ -269,7 +261,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Scheduler";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

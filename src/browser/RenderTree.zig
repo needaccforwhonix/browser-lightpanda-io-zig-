@@ -46,6 +46,12 @@ pub const State = struct {
 
 state: State,
 frame: *Frame,
+skipped: ?Skipped = null,
+
+const Skipped = struct {
+    allocator: std.mem.Allocator,
+    set: *PruneSet,
+};
 
 pub const Child = struct {
     node: *Node,
@@ -68,7 +74,10 @@ const Children = struct {
     pub fn next(self: *Children) ?Child {
         while (self.next_node) |node| {
             self.next_node = node.nextSibling();
-            var child = self.tree.classify(node, .{ .boxed = self.boxed }) orelse continue;
+            var child = self.tree.classify(node, .{ .boxed = self.boxed }) orelse {
+                self.tree.recordSkipped(node);
+                continue;
+            };
             child.separated = self.boxed and self.yielded;
             self.yielded = true;
             return child;
@@ -83,15 +92,32 @@ pub const Slotted = struct {
     assigned: []const *Node,
     fallback: Children,
 
+    pub fn init(children_: Children) Slotted {
+        return .{ .tree = children_.tree, .assigned = &.{}, .fallback = children_ };
+    }
+
     pub fn next(self: *Slotted) ?Child {
         while (self.assigned.len > 0) {
             const node = self.assigned[0];
             self.assigned = self.assigned[1..];
-            return self.tree.classify(node, .{ .slotted = true }) orelse continue;
+            return self.tree.classify(node, .{ .slotted = true }) orelse {
+                self.tree.recordSkipped(node);
+                continue;
+            };
         }
         return self.fallback.next();
     }
 };
+
+fn recordSkipped(self: *const RenderTree, node: *Node) void {
+    const skipped = self.skipped orelse return;
+    const el = node.is(Element) orelse return;
+    if (el.getTag() == .head) {
+        // <head> renders nothing, but we still need its title & base
+        return;
+    }
+    skipped.set.put(skipped.allocator, node, {}) catch {};
+}
 
 pub fn children(self: *const RenderTree, parent: *Node, boxed: bool) Children {
     return .{ .tree = self, .next_node = parent.firstChild(), .boxed = boxed };
@@ -172,14 +198,38 @@ fn visibleDisplay(el: *Element, frame: *Frame) ?StyleManager.Display {
     if (tag.isMetadata() or tag == .svg) {
         return null;
     }
-    const d = frame._style_manager.display(el);
+
+    const owner = el.ownerFrame(frame) orelse return .other;
+    const d = owner._style_manager.display(el);
     if (d == .none) {
         return null;
     }
+    // Browsers render aria-hidden content, so this diverges from innerText on
+    // purpose: inline text under it is decorative in practice (icon ligatures,
+    // the visual twin of sr-only text). Anything holding a block is real
+    // content, like an app root hidden behind a modal, which is often an
+    // unstyled custom element and so inline itself.
     if (el.getAttributeInterned("aria-hidden")) |v| {
-        if (std.ascii.eqlIgnoreCase(v, "true")) return null;
+        if (std.ascii.eqlIgnoreCase(v, "true") and owner._style_manager.isInlineLevel(el) and !holdsBlock(el, owner)) {
+            return null;
+        }
     }
     return d;
+}
+
+fn holdsBlock(el: *Element, frame: *Frame) bool {
+    const style_manager = &frame._style_manager;
+    var tw = TreeWalker.FlatExcludeSelf.init(el.asNode(), .{ .frame = frame });
+    while (tw.next()) |node| {
+        const child = node.is(Element) orelse continue;
+        const tag = child.getTag();
+        if (tag.isMetadata() or tag == .svg or style_manager.display(child) == .none) {
+            tw.skipChildren();
+        } else if (style_manager.isBlockLevel(child)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn isVisibleElement(el: *Element, frame: *Frame) bool {
@@ -337,7 +387,7 @@ fn measureChild(self: *const RenderTree, child: Child, where: Measure.Where, m: 
             const el = child.node.subtype(Element);
             const inner: Measure.Where = .{
                 .shell = where.shell or dump_html.isShellElement(el),
-                .link = where.link or el.getTag() == .anchor,
+                .link = where.link or (el.getTag() == .a and el.getAttributeInterned("href") != null),
             };
             if (el.is(Slot)) |slot| {
                 var it = self.slotted(slot);
@@ -390,6 +440,50 @@ pub fn analyzeContent(root: *Node, frame: *Frame) ContentInfo {
         }
     }
     return result;
+}
+
+/// The href of the one `<a href>` holding all of root's visible content.
+pub fn soleHref(root: *Node, frame: *Frame) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    var tw = TreeWalker.FullExcludeSelf.init(root, .{});
+    while (tw.next()) |node| {
+        if (isSignificantText(node)) return null;
+        const el = node.is(Element) orelse continue;
+        if (!isVisibleElement(el, frame)) {
+            tw.skipChildren();
+            continue;
+        }
+        switch (el.getTag()) {
+            .img => return null,
+            .a => if (el.getAttributeInterned("href")) |href| {
+                if (found != null) return null;
+                found = href;
+                tw.skipChildren();
+            },
+            else => {},
+        }
+    }
+    return found;
+}
+
+/// The text a code span writes for root: its visible text, with each image
+/// as its alt.
+pub fn codeText(allocator: std.mem.Allocator, root: *Node, frame: *Frame) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    var tw = TreeWalker.FullExcludeSelf.init(root, .{});
+    while (tw.next()) |node| {
+        if (node.is(Node.CData.Text)) |text| {
+            try aw.writer.writeAll(text.ownData());
+            continue;
+        }
+        const el = node.is(Element) orelse continue;
+        if (!isVisibleElement(el, frame)) {
+            tw.skipChildren();
+        } else if (el.getTag() == .img) {
+            try aw.writer.writeAll(el.getAttributeInterned("alt") orelse "");
+        }
+    }
+    return aw.written();
 }
 
 const testing = @import("../testing.zig");

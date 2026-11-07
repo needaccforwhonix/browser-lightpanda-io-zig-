@@ -26,6 +26,7 @@ const Frame = @import("../Frame.zig");
 const Transfer = @import("../../network/HttpClient.zig").Transfer;
 
 const EventTarget = @import("EventTarget.zig");
+const MessagePort = @import("MessagePort.zig");
 const MessageEvent = @import("event/MessageEvent.zig");
 const ErrorEvent = @import("event/ErrorEvent.zig");
 const DedicatedWorkerGlobalScope = @import("DedicatedWorkerGlobalScope.zig");
@@ -56,13 +57,9 @@ _url: [:0]const u8,
 _type: WorkerType = .classic,
 _script_loaded: bool = false,
 _script_arena: ?*lp.Arena = null,
-_script_buffer: std.ArrayList(u8) = .empty,
 _http_transfer: ?*Transfer = null,
 
 // Event handlers
-_on_error: ?js.Function.Global = null,
-_on_message: ?js.Function.Global = null,
-_on_messageerror: ?js.Function.Global = null,
 
 const WorkerOptions = struct {
     type: WorkerType = .classic,
@@ -75,7 +72,7 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
     errdefer arena.release();
 
     const resolved_url = try URL.resolve(arena.allocator(), frame.base(), url, .{ .encoding = frame.charset });
-    const self = try frame._page.factory.eventTargetWithAllocator(arena.allocator(), Worker{
+    const self = try frame.page.factory.eventTargetWithAllocator(arena.allocator(), Worker{
         ._arena = arena,
         ._proto = undefined,
         ._frame = frame,
@@ -92,11 +89,11 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
     try frame.trackWorker(self);
 
     if (session.load_resources.worker == false) {
-        log.warnDisabledWorker();
+        frame.page.status.noteSkipped(.worker);
         return self;
     }
 
-    self._script_arena = try session.getArena(.large, "Worker.script");
+    self._script_arena = try session.getArena(.small, "Worker.script");
     errdefer self.releaseScriptArena();
 
     const transfer = frame.newRequest(.{
@@ -110,12 +107,11 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
         .request_mode = .same_origin,
         .credentials_mode = .same_origin,
         .header_callback = httpHeaderCallback,
-        .data_callback = httpDataCallback,
         .done_callback = httpDoneCallback,
         .error_callback = httpErrorCallback,
         .shutdown_callback = httpShutdownCallback,
     }) catch |err| {
-        log.err(.browser, "Worker request", .{ .url = resolved_url, .err = err });
+        log.debug(.browser, "Worker request", .{ .url = resolved_url, .err = err });
         frame.removeWorker(self);
         return err;
     };
@@ -127,7 +123,7 @@ pub fn init(url: []const u8, options: ?WorkerOptions, frame: *Frame) !*Worker {
     self._http_transfer = transfer;
 
     transfer.submit() catch |err| {
-        log.err(.browser, "Worker request", .{ .url = resolved_url, .err = err });
+        log.debug(.browser, "Worker request", .{ .url = resolved_url, .err = err });
         frame.removeWorker(self);
         return err;
     };
@@ -144,6 +140,7 @@ pub fn deinit(self: *Worker) void {
     }
     self.releaseScriptArena();
     self._worker_scope.deinit();
+    self._frame.page.event_listeners.removeTarget(self.asEventTarget());
     self._arena.release();
 }
 
@@ -156,30 +153,24 @@ fn httpHeaderCallback(transfer: *Transfer) !Transfer.HeaderResult {
 
     const status = transfer.responseStatus() orelse return .abort;
     if (status < 200 or status >= 300) {
-        log.warn(.browser, "Worker status", .{
+        log.debug(.browser, "Worker status", .{
             .url = self._url,
             .status = status,
         });
         return .abort;
     }
 
-    try self._script_buffer.ensureTotalCapacityPrecise(self._script_arena.?.allocator(), transfer.bodyLen());
-
     return .proceed;
 }
 
-fn httpDataCallback(transfer: *Transfer, data: []const u8) !void {
+fn httpDoneCallback(transfer: *Transfer) !void {
     const self: *Worker = @ptrCast(@alignCast(transfer.req.ctx));
-    try self._script_buffer.appendSlice(self._script_arena.?.allocator(), data);
-}
-
-fn httpDoneCallback(ctx: *anyopaque) !void {
-    const self: *Worker = @ptrCast(@alignCast(ctx));
     self._http_transfer = null;
     defer self.releaseScriptArena();
 
     const url = self._url;
-    const script = self._script_buffer.items;
+    // Evaluated synchronously, so borrowing the transfer's body is fine.
+    const script = transfer.responseBody();
 
     if (comptime lp.IS_DEBUG) {
         log.info(.browser, "worker fetch done", .{
@@ -235,18 +226,18 @@ fn loadInitialScript(self: *Worker, script: []const u8) !void {
 
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
-            log.err(.browser, "worker script error", .{ .url = self._url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = self._url, .caught = caught });
             self.fireErrorEvent(caught.exception orelse @errorName(err), null);
             return;
         },
-        .module => js_context.module(false, &ls.local, script, self._url, true) catch |err| {
+        .module => js_context.module(false, &ls.local, script, self._url, .{}, true, null) catch |err| {
             if (js_context.env.terminatePending()) {
                 return;
             }
 
             js_context.page.recordJsError(err);
             const caught = try_catch.caughtOrError(self._script_arena.?.allocator(), err);
-            log.err(.browser, "worker module error", .{ .url = self._url, .caught = caught });
+            log.warn(.page_error, "uncaught exception", .{ .url = self._url, .caught = caught });
             self.fireErrorEvent(caught.exception orelse @errorName(err), null);
             return;
         },
@@ -271,7 +262,7 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
     // (or bother logging)
     const canceled = err == error.TransferCanceled;
     if (!canceled) {
-        log.err(.browser, "worker fetch error", .{
+        log.debug(.browser, "worker fetch error", .{
             .url = self._url,
             .err = err,
         });
@@ -292,24 +283,21 @@ fn httpErrorCallback(ctx: *anyopaque, err: anyerror) void {
 fn releaseScriptArena(self: *Worker) void {
     const arena = self._script_arena orelse return;
     self._script_arena = null;
-    self._script_buffer = .empty;
     arena.release();
 }
 
 // Fire an error event on the Worker object (parent context)
 fn fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Global) void {
     self._fireErrorEvent(message, error_value) catch |err| {
-        log.warn(.browser, "worker fire error", .{ .err = err, .message = message });
+        log.debug(.browser, "worker fire error", .{ .err = err, .message = message });
     };
 }
 
 fn _fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Global) !void {
     const frame = self._frame;
     const target = self.asEventTarget();
-    const on_error = self._on_error;
-
     // Check if there are any listeners
-    if (!frame._event_manager.hasDirectListeners(target, "error", on_error)) {
+    if (!frame._event_manager.hasDirectListeners(target, "error")) {
         if (error_value) |ev| ev.release();
         return;
     }
@@ -320,9 +308,9 @@ fn _fireErrorEvent(self: *Worker, message: []const u8, error_value: ?js.Value.Gl
         .filename = self._url,
         .bubbles = false,
         .cancelable = true,
-    }, frame._page);
+    }, frame.page);
 
-    try frame._event_manager.dispatchDirect(target, error_event.asEvent(), on_error, .{
+    try frame._event_manager.dispatchDirect(target, error_event.asEvent(), .{
         .context = "Worker.onerror",
     });
 }
@@ -336,22 +324,17 @@ pub fn terminate(self: *Worker) void {
 }
 
 // Posts a message from the frame to the worker.
-pub fn postMessage(self: *Worker, data: js.Value) !void {
-    try self._worker_scope.receiveMessage(data);
+pub fn postMessage(self: *Worker, data: js.Value, transfer: ?js.Value) !void {
+    try self._worker_scope.receiveMessage(data, try MessagePort.transferList(transfer));
 }
 
 // Called internally by DedicatedWorkerGlobalScope when it wants to post a message to us
-pub fn receiveMessage(self: *Worker, data: js.Value) !void {
+pub fn receiveMessage(self: *Worker, data: js.Value, transfer: []const *MessagePort) !void {
     const frame = self._frame;
-    const cloned_data = blk: {
-        var ls: js.Local.Scope = undefined;
-        frame.js.localScope(&ls);
-        defer ls.deinit();
 
-        // clones from where it currently is (the Worker context) to our Page's context
-        const cloned = data.structuredCloneTo(&ls.local) catch |err| break :blk err;
-        break :blk cloned.persist();
-    };
+    // clones from where it currently is (the Worker context) to our Page's context
+    const message = try MessagePort.cloneMessage(data, transfer, &frame.js.execution);
+    errdefer message.release();
 
     const message_arena = try frame.getArena(.tiny, "Worker.receiveMessage");
     errdefer message_arena.release();
@@ -359,9 +342,11 @@ pub fn receiveMessage(self: *Worker, data: js.Value) !void {
     const callback = try message_arena.create(ReceiveMessageCallback);
     callback.* = .{
         .worker = self,
-        .data = cloned_data,
+        .message = message,
         .arena = message_arena,
+        .hold = frame.page.settle.hold(message.task),
     };
+    errdefer callback.hold.release();
 
     try frame.js.scheduler.add(callback, ReceiveMessageCallback.run, 0, .{
         .name = "Worker.receiveMessage",
@@ -369,53 +354,16 @@ pub fn receiveMessage(self: *Worker, data: js.Value) !void {
     });
 }
 
-fn getOnMessage(self: *const Worker) ?js.Function.Global {
-    return self._on_message;
-}
-
-fn setOnMessage(self: *Worker, setter: ?FunctionSetter) void {
-    self._on_message = getFunctionFromSetter(setter);
-}
-
-fn getOnMessageError(self: *const Worker) ?js.Function.Global {
-    return self._on_messageerror;
-}
-
-fn setOnMessageError(self: *Worker, setter: ?FunctionSetter) void {
-    self._on_messageerror = getFunctionFromSetter(setter);
-}
-
-fn getOnError(self: *const Worker) ?js.Function.Global {
-    return self._on_error;
-}
-
-fn setOnError(self: *Worker, setter: ?FunctionSetter) void {
-    self._on_error = getFunctionFromSetter(setter);
-}
-
-const FunctionSetter = union(enum) {
-    func: js.Function.Global,
-    anything: js.Value,
-};
-
-fn getFunctionFromSetter(setter_: ?FunctionSetter) ?js.Function.Global {
-    const setter = setter_ orelse return null;
-    return switch (setter) {
-        .func => |func| func,
-        .anything => null,
-    };
-}
-
 const ReceiveMessageCallback = struct {
-    data: anyerror!js.Value.Global,
+    message: MessagePort.Message,
     arena: *lp.Arena,
     worker: *Worker,
+    hold: js.Attribution.Hold,
 
     fn cancelled(ctx: *anyopaque) void {
         const self: *ReceiveMessageCallback = @ptrCast(@alignCast(ctx));
-        if (self.data) |d| {
-            d.release();
-        } else |_| {}
+        self.hold.release();
+        self.message.release();
         self.deinit();
     }
 
@@ -426,41 +374,45 @@ const ReceiveMessageCallback = struct {
     fn run(ctx: *anyopaque) !?u32 {
         const self: *ReceiveMessageCallback = @ptrCast(@alignCast(ctx));
         defer self.deinit();
+        defer self.message.releasePorts();
+
+        self.hold.release();
 
         const worker = self.worker;
         const frame = worker._frame;
         const target = worker.asEventTarget();
 
-        // If data is null, structured clone failed - fire messageerror
-        const data = self.data catch |err| {
-            const on_messageerror = worker._on_messageerror;
-            if (!frame._event_manager.hasDirectListeners(target, "messageerror", on_messageerror)) {
+        const task_scope = frame.js.attribution.enterNew(.message, .{ .parent = self.message.task, .label = "Worker" });
+        defer task_scope.exit();
+
+        // If data is null, deserialization failed - fire messageerror
+        const data = self.message.data orelse {
+            if (!frame._event_manager.hasDirectListeners(target, "messageerror")) {
                 return null;
             }
             const event = (try MessageEvent.initTrusted(comptime .wrap("messageerror"), .{
-                .data = .{ .string = @errorName(err) },
+                .ports = self.message.ports,
                 .bubbles = false,
                 .cancelable = false,
-            }, frame._page)).asEvent();
-            try frame._event_manager.dispatchDirect(target, event, on_messageerror, .{ .context = "Worker.messageerror" });
+            }, frame.page)).asEvent();
+            try frame._event_manager.dispatchDirect(target, event, .{ .context = "Worker.messageerror" });
             return null;
         };
 
-        const on_message = worker._on_message;
-
         // Check if there are any listeners before creating the event
-        if (!frame._event_manager.hasDirectListeners(target, "message", on_message)) {
+        if (!frame._event_manager.hasDirectListeners(target, "message")) {
             data.release();
             return null;
         }
 
         const event = (try MessageEvent.initTrusted(comptime .wrap("message"), .{
             .data = .{ .value = data },
+            .ports = self.message.ports,
             .bubbles = false,
             .cancelable = false,
-        }, frame._page)).asEvent();
+        }, frame.page)).asEvent();
 
-        try frame._event_manager.dispatchDirect(target, event, on_message, .{ .context = "Worker.receiveMessage" });
+        try frame._event_manager.dispatchDirect(target, event, .{ .context = "Worker.receiveMessage" });
 
         return null;
     }
@@ -471,7 +423,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Worker";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -480,14 +431,16 @@ pub const JsApi = struct {
     pub const terminate = bridge.function(Worker.terminate, .{});
     pub const postMessage = bridge.function(Worker.postMessage, .{});
 
-    pub const onmessage = bridge.accessor(Worker.getOnMessage, Worker.setOnMessage, .{});
-    pub const onmessageerror = bridge.accessor(Worker.getOnMessageError, Worker.setOnMessageError, .{});
-    pub const onerror = bridge.accessor(Worker.getOnError, Worker.setOnError, .{});
+    pub const onmessage = EventTarget.handlerAccessor(Worker, "message");
+    pub const onmessageerror = EventTarget.handlerAccessor(Worker, "messageerror");
+    pub const onerror = EventTarget.handlerAccessor(Worker, "error");
 };
 
 const testing = @import("../../testing.zig");
 test "WebApi: Worker" {
     testing.silenceLog(&.{ .http, .browser, .browser });
+    // report-error-worker.js throws five uncaught exceptions on purpose.
+    testing.expectLog(&.{ .page_error, .page_error, .page_error, .page_error, .page_error });
 
     // Worker tests chain a worker-script fetch with a dynamic-import fetch
     // and a cross-context postMessage. The default 2 s assertion budget can

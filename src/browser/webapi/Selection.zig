@@ -55,7 +55,7 @@ pub fn acquireRef(self: *Selection) void {
 }
 
 fn dispatchSelectionChangeEvent(frame: *Frame) !void {
-    const event = try Event.init("selectionchange", .{}, frame._page);
+    const event = try Event.init("selectionchange", .{}, frame.page);
     try frame._event_manager.dispatch(frame.document.asEventTarget(), event);
 }
 
@@ -68,7 +68,7 @@ fn isInTree(self: *const Selection) bool {
     return anchor_node.isConnected() and focus_node.isConnected();
 }
 
-fn getAnchorNode(self: *const Selection) ?*Node {
+pub fn getAnchorNode(self: *const Selection) ?*Node {
     const range = self._range orelse return null;
 
     const node = switch (self._direction) {
@@ -619,7 +619,7 @@ fn applyModify(self: *Selection, alter: ModifyAlter, new_node: *Node, new_offset
     }
 }
 
-fn selectAllChildren(self: *Selection, parent: *Node, frame: *Frame) !void {
+pub fn selectAllChildren(self: *Selection, parent: *Node, frame: *Frame) !void {
     if (parent._type == .document_type) return error.InvalidNodeType;
 
     // If the node is not contained in the document, do not change the selection
@@ -714,12 +714,12 @@ pub fn collapse(self: *Selection, _node: ?*Node, _offset: ?u32, frame: *Frame) !
 
 pub fn toString(self: *const Selection, frame: *Frame) ![]const u8 {
     const range = self._range orelse return "";
-    return try range.toString(frame);
+    return try range.toSelectionString(frame);
 }
 
 fn setRange(self: *Selection, new_range: ?*Range, frame: *Frame) void {
     if (self._range) |existing| {
-        _ = existing.asAbstractRange().releaseRef(frame._page);
+        _ = existing.asAbstractRange().releaseRef(frame.page);
     }
     if (new_range) |nr| {
         nr.asAbstractRange().acquireRef();
@@ -732,7 +732,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Selection";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

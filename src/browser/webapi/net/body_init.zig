@@ -55,7 +55,7 @@ pub const BodyInit = union(enum) {
     pub fn sizeHint(self: BodyInit) ?usize {
         return switch (self) {
             .bytes => |b| b.len,
-            .buffer => |b| b.bytes.len,
+            .buffer => |b| b.bytes().len,
             .blob => |b| b._slice.len + b._mime.len,
             .form_data, .url_search_params, .stream => null,
         };
@@ -94,7 +94,7 @@ pub const BodyInit = union(enum) {
                 var buf = std.Io.Writer.Allocating.init(arena);
                 try fd.write(arena, .{ .encoding = .{ .formdata = &boundary } }, &buf.writer);
 
-                const ct = try std.fmt.allocPrint(arena, "multipart/form-data; boundary={s}", .{boundary});
+                const ct = try arena.print("multipart/form-data; boundary={s}", .{boundary});
                 return .{
                     .bytes = buf.written(),
                     .content_type = ct,
@@ -108,7 +108,7 @@ pub const BodyInit = union(enum) {
             },
             .buffer => |b| {
                 return .{
-                    .bytes = try arena.dupe(u8, b.bytes),
+                    .bytes = try arena.dupe(u8, b.bytes()),
                     .content_type = null, // Buffer sources carry no default Content-Type
                 };
             },
@@ -117,7 +117,7 @@ pub const BodyInit = union(enum) {
                 // XHR buffers a closed stream synchronously; a stream that
                 // can't be drained here - still open, or already used as a
                 // body - rejects rather than send Content-Length: 0.
-                const bytes = try stream.collectBodyBytes(arena);
+                const bytes = try stream.collectBodyBytes(arena, .lenient);
                 return .{ .bytes = bytes, .content_type = null };
             },
         }
@@ -207,16 +207,24 @@ test "BodyInit: FormData emits multipart with random boundary" {
     try testing.expectEqual(true, std.mem.startsWith(u8, boundary, "----"));
     try testing.expectEqual(true, boundary.len > 10);
 
-    try testing.expect(std.mem.indexOf(u8, r.bytes, "Content-Disposition: form-data; name=\"username\"") != null);
-    try testing.expect(std.mem.indexOf(u8, r.bytes, "Content-Disposition: form-data; name=\"email\"") != null);
-    try testing.expect(std.mem.indexOf(u8, r.bytes, "alice") != null);
-    try testing.expect(std.mem.indexOf(u8, r.bytes, "alice@example.com") != null);
-    const closer = try std.fmt.allocPrint(arena.allocator(), "--{s}--\r\n", .{boundary});
+    try testing.expect(std.mem.find(u8, r.bytes, "Content-Disposition: form-data; name=\"username\"") != null);
+    try testing.expect(std.mem.find(u8, r.bytes, "Content-Disposition: form-data; name=\"email\"") != null);
+    try testing.expect(std.mem.find(u8, r.bytes, "alice") != null);
+    try testing.expect(std.mem.find(u8, r.bytes, "alice@example.com") != null);
+    const closer = try arena.allocator().print("--{s}--\r\n", .{boundary});
     try testing.expect(std.mem.endsWith(u8, r.bytes, closer));
 }
 
 test "BodyInit: buffer source has no default Content-Type" {
-    const r = try (BodyInit{ .buffer = .{ .bytes = "hello" } }).extract(testing.arena_allocator);
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const value = try ls.local.exec("new TextEncoder().encode('hello')", null);
+    const r = try (BodyInit{ .buffer = try value.toZig(js.BufferSource) }).extract(testing.arena_allocator);
     try testing.expectString("hello", r.bytes);
     try testing.expectEqual(true, r.content_type == null);
 }

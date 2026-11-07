@@ -17,7 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Shared bookkeeping for setTimeout / setInterval (and Window-only
-// setImmediate / requestAnimationFrame / requestIdleCallback). Both Window
+// requestAnimationFrame / requestIdleCallback). Both Window
 // and WorkerGlobalScope embed a Timers and forward their JS-bridged
 // methods through `schedule` / `clear`.
 
@@ -34,12 +34,15 @@ const CLAMP_NESTING = 5;
 // Once we hit this depth, tasks are scheduled with blocks_done = false. This
 // prevents, for example, a setTimeout that sets itself, from blocking the Runner
 // from considering the page "done" forever (more commonly seen with requestAnimationFrame)
+// It's also where a timer chain stops being tracked for `settled`: polling loops
+// re-arm with short delays forever.
 const BLOCKING_NESTING = 10;
 
-// Every pending timeout, interval, animation frame and setImmediate. Past
+// Every pending timeout, interval, animation frame and idle callback. Past
 // the cap setTimeout throws, which no browser does; keep it a backstop for
-// runaway pages, not a budget (a paginated storefront listing holds ~2.7k).
-const MAX_CALLBACKS = 8192;
+// runaway pages, not a budget (a paginated storefront listing holds ~2.7k, an
+// event bus that relays through setTimeout(fn, 0) ~8.4k from one task).
+const MAX_CALLBACKS = 65536;
 
 // lower limit for repeating timers since they never clean up
 // (unless clearInterval is called)
@@ -82,11 +85,16 @@ pub const Mode = enum {
 
 const ScheduleOpts = struct {
     repeat: bool,
-    params: []js.Value.Global,
+    params: []const js.Value.Global,
     name: []const u8,
     blocks_done: bool = true,
     mode: Mode = .normal,
 };
+
+// setTimeout/setInterval take the delay as a WebIDL long: wrapped to 32 bits, negatives clamped to 0.
+pub fn delayFromJs(delay_ms: ?i32) u32 {
+    return @intCast(@max(delay_ms orelse 0, 0));
+}
 
 pub fn schedule(
     self: *Timers,
@@ -116,13 +124,14 @@ pub fn schedule(
         persisted_params = try arena.dupe(js.Value.Global, opts.params);
     }
 
-    const gop = try self._callbacks.getOrPut(exec.arena, timer_id);
+    const gop = try self._callbacks.getOrPut(exec.page_arena, timer_id);
     if (gop.found_existing) {
         // 2^31 would have to wrap for this to happen.
         return error.TooManyTimeout;
     }
     errdefer _ = self._callbacks.remove(timer_id);
 
+    const parent_task = exec.js.attribution.current();
     const callback = try arena.create(ScheduleCallback);
     callback.* = .{
         .cb = cb,
@@ -135,7 +144,14 @@ pub fn schedule(
         .timer_id = timer_id,
         .params = persisted_params,
         .repeat_ms = if (opts.repeat) if (delay == 0) 1 else delay else null,
+        .delay_ms = delay,
+        .parent_task = parent_task,
+        .hold = if (opts.repeat == false and opts.mode == .normal and delay < js.Attribution.short_timeout_ms and nesting <= BLOCKING_NESTING)
+            exec.page.settle.hold(parent_task)
+        else
+            .{},
     };
+    errdefer callback.hold.release();
     gop.value_ptr.* = callback;
 
     try exec.js.scheduler.add(callback, ScheduleCallback.run, delay, .{
@@ -150,6 +166,12 @@ pub fn schedule(
     return timer_id;
 }
 
+// The scheduler was reset, which finalized every pending callback.
+pub fn reset(self: *Timers) void {
+    self._callbacks.clearRetainingCapacity();
+    self._repeating = 0;
+}
+
 pub fn clear(self: *Timers, id: u32) void {
     var sc = self._callbacks.fetchRemove(id) orelse return;
     if (sc.value.repeat_ms != null) {
@@ -160,18 +182,23 @@ pub fn clear(self: *Timers, id: u32) void {
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timerhandler
-// TimerHandler = Function or DOMString. When a string is passed, it is
-// compiled into an anonymous function body, matching how legacy browsers
-// (and all current UAs) interpret `setTimeout("foo()", 100)`.
+// TimerHandler = Function or DOMString. Anything that isn't callable is
+// converted to a string (WebIDL union conversion), so `setTimeout(undefined)`
+// compiles the script "undefined". The string is compiled into an anonymous
+// function body, e.g. `setTimeout("foo()", 100)`.
 pub const LegacyHandler = union(enum) {
     function: js.Function.Global,
-    string: js.String,
+    string: js.Value,
 
     pub fn resolve(handler: LegacyHandler, exec: *js.Execution) !js.Function.Global {
         switch (handler) {
             .function => |fun| return fun,
-            .string => |str| {
-                const fun = try exec.js.local.?.compileFunction(str, &.{}, &.{});
+            .string => |value| {
+                // Value.toString() uses a Symbol's description; ToString throws.
+                if (value.isSymbol()) {
+                    return error.InvalidArgument;
+                }
+                const fun = try exec.js.local.?.compileFunction(try value.toString(), &.{}, &.{});
                 return fun.persist();
             },
         }
@@ -188,6 +215,14 @@ const ScheduleCallback = struct {
     // delay, in ms, to repeat. When null, removed after first invocation.
     repeat_ms: ?u32,
 
+    delay_ms: u32,
+
+    // The task that scheduled this one.
+    parent_task: ?js.Attribution.Tag,
+
+    // Noop for timers that don't hold the settle
+    hold: js.Attribution.Hold,
+
     // The nesting of this task. When it executes, this nesting will become
     // the Timer's _nesting_level so that any new timers will become nesting + 1
     nesting: u8,
@@ -203,6 +238,7 @@ const ScheduleCallback = struct {
 
     fn cancelled(ptr: *anyopaque) void {
         var self: *ScheduleCallback = @ptrCast(@alignCast(ptr));
+        self.hold.release();
         self.deinit();
     }
 
@@ -214,8 +250,35 @@ const ScheduleCallback = struct {
         self.arena.release();
     }
 
+    // An exception the callback doesn't catch is reported to the global, so
+    // window's "error" event and onerror see it — the "report an exception"
+    // step of the timer initialization steps and of running animation frame
+    // and idle callbacks.
+    fn invoke(self: *ScheduleCallback, local: *const js.Local, args: anytype, comptime context: []const u8) void {
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(local);
+        defer try_catch.deinit();
+
+        local.toLocal(self.cb).callRethrow(void, args) catch |err| {
+            if (err == error.JsException or err == error.TryCatchRethrow) {
+                if (try_catch.exceptionValue()) |exc| {
+                    // reportError also counts the error on the page.
+                    self.exec.reportError(exc) catch |report_err| {
+                        log.debug(.js, context ++ " report error", .{ .name = self.name, .err = report_err });
+                    };
+                    return;
+                }
+            }
+            self.exec.page.recordJsError(err);
+            log.debug(.js, context, .{ .name = self.name, .err = err });
+        };
+    }
+
     fn run(ptr: *anyopaque) !?u32 {
         const self: *ScheduleCallback = @ptrCast(@alignCast(ptr));
+        // Settled is only checked between tasks, and work this run starts
+        // takes its own holds.
+        self.hold.release();
         if (self.removed) {
             self.deinit();
             return null;
@@ -225,6 +288,21 @@ const ScheduleCallback = struct {
         self.exec.js.localScope(&ls);
         defer ls.deinit();
 
+        const attribution = self.exec.js.attribution;
+        const kind: js.Attribution.Kind = switch (self.mode) {
+            .idle => .idle,
+            .animation_frame => .animation_frame,
+            .normal => if (self.repeat_ms == null) .timeout else .interval,
+        };
+        const task = attribution.begin(kind, .{
+            .label = self.name,
+            .delay_ms = self.delay_ms,
+            .parent = self.parent_task,
+            .cut = self.nesting > BLOCKING_NESTING,
+        });
+        const task_scope = attribution.enter(task);
+        defer task_scope.exit();
+
         const timers = self.timers;
         const prev_nesting = timers._nesting_level;
         timers._nesting_level = self.nesting;
@@ -233,27 +311,16 @@ const ScheduleCallback = struct {
         switch (self.mode) {
             .idle => {
                 const IdleDeadline = @import("IdleDeadline.zig");
-                ls.toLocal(self.cb).call(void, .{IdleDeadline{}}) catch |err| {
-                    self.exec.page.recordJsError(err);
-                    log.warn(.js, "idleCallback", .{ .name = self.name, .err = err });
-                };
+                self.invoke(&ls.local, .{IdleDeadline{}}, "idleCallback");
             },
             .animation_frame => {
                 const now = switch (self.exec.js.global) {
                     .frame => |frame| frame.window._performance.now(),
                     .worker => |worker| worker._performance.now(),
                 };
-                ls.toLocal(self.cb).call(void, .{now}) catch |err| {
-                    self.exec.page.recordJsError(err);
-                    log.warn(.js, "RAF", .{ .name = self.name, .err = err });
-                };
+                self.invoke(&ls.local, .{now}, "RAF");
             },
-            .normal => {
-                ls.toLocal(self.cb).call(void, self.params) catch |err| {
-                    self.exec.page.recordJsError(err);
-                    log.warn(.js, "timer", .{ .name = self.name, .err = err });
-                };
-            },
+            .normal => self.invoke(&ls.local, self.params, "timer"),
         }
         ls.local.runMicrotasks();
 

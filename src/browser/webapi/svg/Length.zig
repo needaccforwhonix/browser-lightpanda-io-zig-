@@ -23,6 +23,7 @@ const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const Page = @import("../../Page.zig");
 const units = @import("../../css/units.zig");
+const StyleManager = @import("../../StyleManager.zig");
 const Element = @import("../Element.zig");
 
 const String = lp.String;
@@ -65,7 +66,7 @@ pub const Unit = enum(u16) {
 const MAX_ANCESTOR_DEPTH = 32;
 
 pub fn detached(frame: *Frame) !*Length {
-    const arena = try frame._page.getArena(.tiny, "SVGLength");
+    const arena = try frame.page.getArena(.tiny, "SVGLength");
     errdefer arena.release();
     const self = try arena.create(Length);
     self.* = .{ ._rc = .{}, ._arena = arena };
@@ -105,7 +106,7 @@ pub fn reflectedConfigured(
 
 fn getUnitType(self: *Length) u16 {
     self.syncFromAttribute();
-    return @intFromEnum(self._unit);
+    return @backingInt(self._unit);
 }
 
 // An attribute SVG could not parse reports the unknown unit type. Callers that
@@ -217,7 +218,7 @@ fn writeBack(self: *Length, frame: *Frame) !void {
 }
 
 fn serialize(self: *const Length, frame: *Frame) ![]const u8 {
-    return std.fmt.allocPrint(frame.local_arena, "{d}{s}", .{ self._value, units.suffix(toShared(self._unit)) });
+    return frame.local_arena.print("{d}{s}", .{ self._value, units.suffix(toShared(self._unit)) });
 }
 
 fn unitToUserUnits(self: *const Length, unit: Unit, frame: *Frame) f64 {
@@ -279,7 +280,7 @@ fn nearestSvgViewport(element: *Element) ?*Element {
 }
 
 fn pageViewportDimension(direction: Direction, frame: *Frame) f64 {
-    const viewport = frame._page.getViewport();
+    const viewport = frame.page.getViewport();
     return switch (direction) {
         .horizontal => @floatFromInt(viewport.width),
         .vertical => @floatFromInt(viewport.height),
@@ -290,16 +291,28 @@ fn pageViewportDimension(direction: Direction, frame: *Frame) f64 {
 fn resolveParsedLength(parsed: Parsed, element: *Element, direction: Direction, frame: *Frame, depth: u8) f64 {
     const factor = switch (parsed.unit) {
         .percentage => ancestorViewportDimensionAt(element, direction, frame, depth) / 100.0,
-        .em => element.ownerFrame(frame)._style_manager.computedFontSize(element),
-        .ex => element.ownerFrame(frame)._style_manager.computedFontSize(element) / 2.0,
+        .em => elementFontSize(element, frame),
+        .ex => elementFontSize(element, frame) / 2.0,
         else => units.absoluteLengthFactor(toShared(parsed.unit)).?,
     };
     return parsed.value * factor;
 }
 
+/// Resolves one length as written in an attribute, in user units relative to
+/// `element`. Null when it doesn't parse.
+pub fn resolve(raw: []const u8, element: *Element, direction: Direction, frame: *Frame) ?f64 {
+    const parsed = parse(raw) catch return null;
+    return resolveParsedLength(parsed, element, direction, frame, 0);
+}
+
 fn fontSize(self: *const Length, frame: *Frame) f64 {
-    const element = self._element orelse return frame._style_manager.computedFontSize(null);
-    return element.ownerFrame(frame)._style_manager.computedFontSize(element);
+    const element = self._element orelse return StyleManager.DEFAULT_FONT_SIZE;
+    return elementFontSize(element, frame);
+}
+
+fn elementFontSize(element: *Element, frame: *Frame) f64 {
+    const owner = element.ownerFrame(frame) orelse return StyleManager.DEFAULT_FONT_SIZE;
+    return owner._style_manager.computedFontSize(element);
 }
 
 const Parsed = struct {
@@ -325,7 +338,7 @@ fn fromShared(unit: units.Unit) ?Unit {
         .in => .in,
         .pt => .pt,
         .pc => .pc,
-        .vh, .vw, .deg, .rad, .grad, .turn => null,
+        .rem, .vh, .vw, .deg, .rad, .grad, .turn => null,
     };
 }
 
@@ -360,12 +373,21 @@ fn checkedUnit(value: u16) !Unit {
     };
 }
 
+// value and valueInSpecifiedUnits are WebIDL `float`. Storage stays f64 so
+// valueAsString serializes what was parsed, not its f32 rounding.
+fn jsGetValue(self: *Length, frame: *Frame) f32 {
+    return @floatCast(self.getValue(frame));
+}
+
+fn jsGetValueInSpecifiedUnits(self: *Length) f32 {
+    return @floatCast(self.getValueInSpecifiedUnits());
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Length);
 
     pub const Meta = struct {
         pub const name = "SVGLength";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -382,8 +404,8 @@ pub const JsApi = struct {
     pub const SVG_LENGTHTYPE_PC = bridge.property(10, .{ .template = true });
 
     pub const unitType = bridge.accessor(Length.getUnitType, null, .{});
-    pub const value = bridge.accessor(Length.getValue, Length.setValue, .{});
-    pub const valueInSpecifiedUnits = bridge.accessor(Length.getValueInSpecifiedUnits, Length.setValueInSpecifiedUnits, .{});
+    pub const value = bridge.accessor(Length.jsGetValue, Length.setValue, .{});
+    pub const valueInSpecifiedUnits = bridge.accessor(Length.jsGetValueInSpecifiedUnits, Length.setValueInSpecifiedUnits, .{});
     pub const valueAsString = bridge.accessor(Length.getValueAsString, Length.setValueAsString, .{});
     pub const newValueSpecifiedUnits = bridge.function(Length.newValueSpecifiedUnits, .{});
     pub const convertToSpecifiedUnits = bridge.function(Length.convertToSpecifiedUnits, .{});

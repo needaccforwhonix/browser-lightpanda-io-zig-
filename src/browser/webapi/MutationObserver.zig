@@ -171,7 +171,7 @@ pub fn observe(self: *MutationObserver, target: *Node, options: ObserveOptions, 
 }
 
 pub fn disconnect(self: *MutationObserver, frame: *Frame) void {
-    releaseAll(self._pending_records.items, frame._page);
+    releaseAll(self._pending_records.items, frame.page);
     self._pending_records.clearRetainingCapacity();
 
     if (self._observing.items.len > 0) {
@@ -184,7 +184,7 @@ fn takeRecords(self: *MutationObserver, frame: *Frame) !js.Value {
     const local = frame.js.local orelse return error.NotHandled;
     const records = try self.takePendingRecords(frame);
     // whether we safely deliver these to v8 or not, we're done with these
-    defer releaseAll(records, frame._page);
+    defer releaseAll(records, frame.page);
     return local.zigValueToJs(records, .{});
 }
 
@@ -356,15 +356,14 @@ pub fn deliverRecords(self: *MutationObserver, frame: *Frame) !void {
     // This ensures mutations triggered during the callback go into a fresh list
     const records = try self.takePendingRecords(frame);
     // whether we safely deliver these to v8 or not, we're done with these
-    defer releaseAll(records, frame._page);
+    defer releaseAll(records, frame.page);
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    var caught: js.TryCatch.Caught = .{};
-    ls.toLocal(self._callback).tryCallWithThis(void, self, .{ records, self }, &caught) catch |err| {
-        log.err(.frame, "MutObserver.deliverRecords", .{ .err = err, .caught = caught });
+    ls.toLocal(self._callback).callWithThisReport(self, .{ records, self }) catch |err| {
+        log.debug(.frame, "MutObserver.deliverRecords", .{ .err = err });
         return err;
     };
 }
@@ -447,7 +446,6 @@ pub const MutationRecord = struct {
 
         pub const Meta = struct {
             pub const name = "MutationRecord";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -468,7 +466,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "MutationObserver";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -481,7 +478,6 @@ pub const JsApi = struct {
 
 const testing = @import("../../testing.zig");
 test "WebApi: MutationObserver" {
-    testing.expectLog(&.{ .frame, .frame });
     try testing.htmlRunner("mutation_observer", .{});
 }
 
@@ -527,7 +523,6 @@ test "WebApi: runaway MutationObserver delivery is disconnected" {
 // and leave the observer machinery usable after a top-level cancel.
 test "WebApi: MutationObserver requested termination unwinds delivery" {
     const v8 = js.v8;
-    testing.expectLog(&.{ .frame, .frame });
 
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
@@ -588,8 +583,6 @@ test "WebApi: MutationObserver requested termination unwinds delivery" {
 }
 
 test "WebApi: MutationObserver terminate requested between observers releases records" {
-    testing.expectLog(&.{ .frame, .frame });
-
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
@@ -627,8 +620,6 @@ test "WebApi: MutationObserver terminate requested between observers releases re
 }
 
 test "WebApi: MutationObserver terminated page tears down" {
-    testing.expectLog(&.{ .frame, .frame });
-
     const frame = try testing.createFrame();
     const env = frame.js.env;
     defer env.cancelTerminate();

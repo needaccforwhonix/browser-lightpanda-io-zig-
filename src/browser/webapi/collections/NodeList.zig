@@ -99,7 +99,7 @@ pub fn forEach(self: *NodeList, cb: js.Function, frame: *Frame) !void {
 
         var caught: js.TryCatch.Caught = .{};
         cb.tryCall(void, .{ node, i, self }, &caught) catch |err| {
-            frame._page.recordJsError(err);
+            frame.page.recordJsError(err);
             log.debug(.js, "forEach callback", .{ .caught = caught, .source = "nodelist" });
             return;
         };
@@ -142,7 +142,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "NodeList";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

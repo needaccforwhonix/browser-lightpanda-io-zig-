@@ -39,8 +39,6 @@ pub type AppendDoctypeToDocumentCallback = unsafe extern "C" fn(
 pub type CreateProcessingInstruction =
     unsafe extern "C" fn(ctx: Ref, target: StringSlice, data: StringSlice) -> Ref;
 
-pub type GetDataCallback = unsafe extern "C" fn(ctx: Ref) -> *mut c_void;
-
 pub type AppendCallback =
     unsafe extern "C" fn(ctx: Ref, parent: Ref, node_or_text: CNodeOrText) -> ();
 
@@ -165,6 +163,14 @@ impl Default for CAttribute {
 pub struct CAttributeIterator {
     pub vec: Vec<Attribute>,
     pub pos: usize,
+}
+
+// 0-based, the column in UTF-16 code units: the unit of V8's script offsets.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TextPosition {
+    pub line: u32,
+    pub column: u32,
 }
 
 #[repr(C)]

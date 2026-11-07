@@ -66,14 +66,11 @@ pub fn getValue(self: *const Attribute) String {
 pub fn setValue(self: *Attribute, data_: ?String, frame: *Frame) !void {
     const data = data_ orelse String.empty;
     const el = self._element orelse {
-        self._value = try data.dupe(frame.arena);
+        self._value = try data.dupe(frame.page_arena);
         return;
     };
     // this takes ownership of the data
     try el.setAttribute(self._name, data, frame);
-
-    // not the most efficient, but we don't expect this to be called often
-    self._value = (try el.getAttribute(self._name, frame)) orelse String.empty;
 }
 
 pub fn getNamespaceURI(_: *const Attribute) ?[]const u8 {
@@ -88,20 +85,12 @@ pub fn isEqualNode(self: *const Attribute, other: *const Attribute) bool {
     return self.getName().eql(other.getName()) and self.getValue().eql(other.getValue());
 }
 
-pub fn clone(self: *const Attribute, frame: *Frame) !*Attribute {
-    const cloned = try frame._factory.node(Attribute{
+pub fn clone(self: *const Attribute, document: *const Node.Document, frame: *Frame) !*Attribute {
+    return frame._factory.node(document, Attribute{
         ._element = null,
         ._name = self._name,
         ._value = self._value,
     });
-
-    if (self._element) |el| {
-        // cloned has no element, we need to store its document
-        if (el.asNode().ownerDocument(frame)) |doc| {
-            try frame.setNodeOwnerDocument(cloned.asNode(), doc);
-        }
-    }
-    return cloned;
 }
 
 pub const JsApi = struct {
@@ -109,7 +98,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Attr";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -134,7 +122,7 @@ pub const JsApi = struct {
 // Attribute value (the same JSValue) when called multiple time, and that gets
 // more important when you look at the [hardly every used] el.removeAttributeNode
 // and setAttributeNode.
-// So, we maintain a lookup, frame._attribute_lookup, to serve as an identity map
+// So, we maintain a lookup, page.attribute_lookup, to serve as an identity map
 // from our internal Entry to a proper Attribute. This is lazily populated
 // whenever an Attribute is created. Why not just have an ?*Attribute field
 // in our Entry? Because that would require an extra 8 bytes for every single
@@ -149,7 +137,7 @@ pub const List = struct {
 
     pub const Lookup = std.AutoHashMapUnmanaged(LookupKey, *Attribute);
 
-    // for Frame._attribute_lookup which is our identity map for attributes
+    // for Page.attribute_lookup which is our identity map for attributes
     const LookupKey = struct {
         list: *const List,
         // canonical (see canonicalizeName), so identity is the address
@@ -212,38 +200,44 @@ pub const List = struct {
         return self.getEntryWithInternedName(name) != null;
     }
 
-    pub fn getAttribute(self: *const List, name: String, element: ?*Element, frame: *Frame) !?*Attribute {
+    pub fn getAttribute(self: *const List, name: String, element: *Element, frame: *Frame) !?*Attribute {
         const entry = (try self.getEntry(name, frame)) orelse return null;
         return self.getOrCreateAttribute(entry, element, frame);
     }
 
     // Identity map access: a given (list, name) always yields the same
-    // *Attribute until the attribute is removed. The map must be the
-    // element's frame's, not the caller's frame.
-    pub fn getOrCreateAttribute(self: *const List, entry: *const Entry, element: ?*Element, frame: *Frame) !*Attribute {
-        const owner = if (element) |el| el.ownerFrame(frame) else frame;
-        const gop = try owner._attribute_lookup.getOrPut(owner.arena, .{ .list = self, .name = entry._name_ptr });
+    // *Attribute until the attribute is removed.
+    pub fn getOrCreateAttribute(self: *const List, entry: *const Entry, element: *Element, frame: *Frame) !*Attribute {
+        const page = frame.page;
+        const gop = try page.attribute_lookup.getOrPut(page.arena, .{ .list = self, .name = entry._name_ptr });
         if (!gop.found_existing) {
-            gop.value_ptr.* = try entry.toAttribute(element, owner);
+            gop.value_ptr.* = try entry.toAttribute(element, element.ownerFrame(frame) orelse frame);
         }
         return gop.value_ptr.*;
     }
 
     pub fn put(self: *List, name: String, value: String, element: *Element, frame: *Frame) ![]const u8 {
         const result = try self.getEntryAndNormalizedName(name, frame);
-        return self._put(result, value, element, frame);
+        return self._put(result, value, element, frame, .dom);
     }
 
     pub fn putSafe(self: *List, name: String, value: String, element: *Element, frame: *Frame) ![]const u8 {
         const entry = self.getEntryWithNormalizedName(name);
-        return self._put(.{ .entry = entry, .normalized = name }, value, element, frame);
+        return self._put(.{ .entry = entry, .normalized = name }, value, element, frame, .dom);
+    }
+
+    // A style attribute whose change no selector can see.
+    pub fn putInertStyle(self: *List, value: String, element: *Element, frame: *Frame) !void {
+        const name = comptime String.wrap("style");
+        const entry = self.getEntryWithNormalizedName(name);
+        _ = try self._put(.{ .entry = entry, .normalized = name }, value, element, frame, .layout);
     }
 
     // Returns the entry's canonical name, not the *Entry: attributeChange can
     // run script which mutates the list, moving or shifting entries. The
     // canonical name is interned, so it stays valid.
-    fn _put(self: *List, result: NormalizeAndEntry, value: String, element: *Element, frame: *Frame) ![]const u8 {
-        const owner = element.ownerFrame(frame);
+    fn _put(self: *List, result: NormalizeAndEntry, value: String, element: *Element, frame: *Frame, comptime change: enum { dom, layout }) ![]const u8 {
+        const owner = element.ownerFrame(frame) orelse frame;
         const is_id = shouldAddToIdMap(result.normalized, element);
 
         var entry: *Entry = undefined;
@@ -256,6 +250,16 @@ pub const List = struct {
             }
             e.setValue(try owner.dupeString(value.str()));
             entry = e;
+
+            // An Attr is the attribute itself, so one handed out earlier must
+            // see the new value. Every write to an existing entry lands here.
+            // putAttribute detaches the Attr it replaces before calling us:
+            // that one keeps its old value.
+            if (frame.page.attribute_lookup.get(.{ .list = self, .name = e._name_ptr })) |attr| {
+                if (attr._element != null) {
+                    attr._value = .wrap(e.value());
+                }
+            }
         } else {
             try self.ensureUnusedCapacity(1, owner);
             entry = &self._entries[self._len];
@@ -273,8 +277,11 @@ pub const List = struct {
             };
             try owner.addElementId(parent, element, entry.value());
         }
-        owner.domChanged();
-        owner.attributeChange(element, result.normalized, .wrap(entry.value()), old_value);
+        switch (change) {
+            .dom => owner.domChanged(),
+            .layout => owner.layoutObserversChanged(),
+        }
+        owner.attributeChange(element, .wrap(name), .wrap(entry.value()), old_value);
         return name;
     }
 
@@ -312,22 +319,37 @@ pub const List = struct {
 
         const name = try self.put(attribute._name, attribute._value, element, frame);
         attribute._element = element;
-        const owner = element.ownerFrame(frame);
-        try owner._attribute_lookup.put(owner.arena, .{ .list = self, .name = name.ptr }, attribute);
+        attribute.asNode()._owner = element.asNode()._owner;
+        const page = frame.page;
+        try page.attribute_lookup.put(page.arena, .{ .list = self, .name = name.ptr }, attribute);
         return existing_attribute;
     }
 
+    // An Attr's node document follows its element's: re-own the ones handed out
+    pub fn adopt(self: *const List, owner: u32, frame: *const Frame) void {
+        const lookup = &frame.page.attribute_lookup;
+        if (lookup.count() == 0) {
+            return;
+        }
+        for (self.entries()) |*entry| {
+            if (lookup.get(.{ .list = self, .name = entry._name_ptr })) |attr| {
+                attr.asNode()._owner = owner;
+            }
+        }
+    }
+
     // called form our parser, names already lower-cased
-    pub fn putNew(self: *List, name: []const u8, value: []const u8, frame: *Frame) !void {
+    /// Whether the attribute was added.
+    pub fn putNew(self: *List, name: []const u8, value: []const u8, frame: *Frame) !bool {
         if (try self.getEntry(.wrap(name), frame) != null) {
             // When parsing, if there are duplicate names, it isn't valid, and
             // the first is kept
-            return;
+            return false;
         }
         const len = self._len;
         if (len == std.math.maxInt(u16) or name.len > std.math.maxInt(u32) or value.len > std.math.maxInt(u32)) {
             // Bad input. Drop rather than fail the parse
-            return;
+            return false;
         }
 
         try self.ensureUnusedCapacity(1, frame);
@@ -336,6 +358,7 @@ pub const List = struct {
             try frame.dupeString(value),
         );
         self._len = len + 1;
+        return true;
     }
 
     pub fn delete(self: *List, name: String, element: *Element, frame: *Frame) !void {
@@ -350,9 +373,10 @@ pub const List = struct {
     }
 
     fn _delete(self: *List, entry: *Entry, normalized: String, element: *Element, frame: *Frame) void {
-        const owner = element.ownerFrame(frame);
+        const owner = element.ownerFrame(frame) orelse frame;
         const is_id = shouldAddToIdMap(normalized, element);
         const old_value = entry.value();
+        const name = entry.name();
 
         if (is_id) {
             owner.removeElementId(element, old_value);
@@ -360,7 +384,7 @@ pub const List = struct {
 
         // remove this BEFORE triggering anything, incase that re-enters delete
         // or some other callback.
-        if (owner._attribute_lookup.fetchRemove(.{ .list = self, .name = entry._name_ptr })) |kv| {
+        if (frame.page.attribute_lookup.fetchRemove(.{ .list = self, .name = entry._name_ptr })) |kv| {
             // The attribute can still be alive
             kv.value._element = null;
         }
@@ -370,7 +394,7 @@ pub const List = struct {
         self._len -= 1;
 
         owner.domChanged();
-        owner.attributeRemove(element, normalized, .wrap(old_value));
+        owner.attributeRemove(element, .wrap(name), .wrap(old_value));
     }
 
     pub fn getNames(self: *const List, allocator: Allocator) ![][]const u8 {
@@ -405,9 +429,9 @@ pub const List = struct {
             return;
         }
         if (self._cap == 0) {
-            self._entries = (try frame.arena.alloc(Entry, new_cap)).ptr;
+            self._entries = (try frame.page_arena.alloc(Entry, new_cap)).ptr;
         } else {
-            self._entries = (try frame.arena.realloc(self._entries[0..self._cap], new_cap)).ptr;
+            self._entries = (try frame.page_arena.realloc(self._entries[0..self._cap], new_cap)).ptr;
         }
         self._cap = new_cap;
     }
@@ -417,8 +441,8 @@ pub const List = struct {
         return result.entry;
     }
 
-    // Dangerous, the returned normalized name is only valid until someone
-    // else uses pages.buf.
+    // Dangerous, the returned normalized name can live in frame.local_arena,
+    // so it's only valid until that's reset.
     const NormalizeAndEntry = struct {
         entry: ?*Entry,
         normalized: String,
@@ -504,8 +528,8 @@ pub const List = struct {
             return formatAttribute(self.name(), self.value(), writer);
         }
 
-        fn toAttribute(self: *const Entry, element: ?*Element, frame: *Frame) !*Attribute {
-            return frame._factory.node(Attribute{
+        fn toAttribute(self: *const Entry, element: *Element, frame: *Frame) !*Attribute {
+            return frame._factory.node(element.getDocument(frame), Attribute{
                 ._element = element,
                 // The entry's bytes outlive the entry itself, so the
                 // Attribute can wrap them without duping.
@@ -540,23 +564,23 @@ pub fn validateAttributeName(name: String) !void {
         return error.InvalidCharacterError;
     }
 
-    if (std.mem.indexOfAny(u8, name_str, invalid_name_chars) != null) {
+    if (std.mem.findAny(u8, name_str, invalid_name_chars) != null) {
         return error.InvalidCharacterError;
     }
 }
 
 // Every stored entry name either comes from the static String.intern or from
-// the frame._attribute_names. Beyond avoiding extra dupes/allocations, this
-// gives a stable pointer for the frame's lifetime, which List.LookupKey
-// relies on for identity. The pointer is NOT comparable across frames (each
-// frame has its own pool), which is why lookups byte-compare.
+// the page's attribute_names. Beyond avoiding extra dupes/allocations, this
+// gives a stable pointer for the page's lifetime, which List.LookupKey
+// relies on for identity.
 fn canonicalizeName(name: []const u8, frame: *Frame) ![]const u8 {
     if (String.intern(name)) |static| {
         return static;
     }
-    const gop = try frame._attribute_names.getOrPut(frame.arena, name);
+    const page = frame.page;
+    const gop = try page.attribute_names.getOrPut(page.arena, name);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try frame.arena.dupe(u8, name);
+        gop.key_ptr.* = try page.arena.dupe(u8, name);
     }
     return gop.key_ptr.*;
 }
@@ -565,20 +589,18 @@ fn normalizeNameForLookup(name: String, frame: *Frame) !String {
     if (!needsLowerCasing(name.str())) {
         return name;
     }
-    const normalized = if (name.len < frame.buf.len)
-        std.ascii.lowerString(&frame.buf, name.str())
-    else
-        try std.ascii.allocLowerString(frame.local_arena, name.str());
-
+    const normalized = try std.ascii.allocLowerString(frame.local_arena, name.str());
     return .wrap(normalized);
 }
 
 pub fn needsLowerCasing(name: []const u8) bool {
     var remaining = name;
     if (comptime std.simd.suggestVectorLength(u8)) |vector_len| {
+        const V = @Vector(vector_len, u8);
         while (remaining.len > vector_len) {
-            const chunk: @Vector(vector_len, u8) = remaining[0..vector_len].*;
-            if (@reduce(.Min, chunk) <= 'Z') {
+            const chunk: V = remaining[0..vector_len].*;
+            // 'A'...'Z' wrap to 0...25, every other byte to 26 or more
+            if (@reduce(.Min, chunk -% @as(V, @splat('A'))) < 26) {
                 return true;
             }
             remaining = remaining[vector_len..];
@@ -623,6 +645,10 @@ pub const NamedNodeMap = struct {
         return self.list().getAttribute(name, self._element, frame);
     }
 
+    fn getByNameNS(self: *const NamedNodeMap, namespace: ?[]const u8, local_name: String, frame: *Frame) !?*Attribute {
+        return self._element.getAttributeNodeNS(namespace, local_name, frame);
+    }
+
     pub fn set(self: *const NamedNodeMap, attribute: *Attribute, frame: *Frame) !?*Attribute {
         return self._element.setAttributeNode(attribute, frame);
     }
@@ -633,6 +659,10 @@ pub const NamedNodeMap = struct {
         const attr = (try self.getByName(name, frame)) orelse return null;
         try self.list().delete(name, self._element, frame);
         return attr;
+    }
+
+    fn removeByNameNS(self: *const NamedNodeMap, namespace: ?[]const u8, local_name: String, frame: *Frame) !?*Attribute {
+        return self.removeByName(try self._element.attributeNameNS(namespace, local_name, frame), frame);
     }
 
     pub fn iterator(self: *const NamedNodeMap, frame: *Frame) !*Iterator {
@@ -655,7 +685,6 @@ pub const NamedNodeMap = struct {
 
         pub const Meta = struct {
             pub const name = "NamedNodeMap";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -691,8 +720,12 @@ pub const NamedNodeMap = struct {
         }.wrap, .{ .null_as_undefined = true });
 
         pub const getNamedItem = bridge.function(NamedNodeMap.getByName, .{});
+        pub const getNamedItemNS = bridge.function(NamedNodeMap.getByNameNS, .{});
         pub const setNamedItem = bridge.function(NamedNodeMap.set, .{ .ce_reactions = true });
+        // Attributes don't carry a namespace, so this is setNamedItem.
+        pub const setNamedItemNS = bridge.function(NamedNodeMap.set, .{ .ce_reactions = true });
         pub const removeNamedItem = bridge.function(NamedNodeMap.removeByName, .{ .ce_reactions = true });
+        pub const removeNamedItemNS = bridge.function(NamedNodeMap.removeByNameNS, .{ .ce_reactions = true });
         pub const item = bridge.function(_item, .{});
         fn _item(self: *const NamedNodeMap, index: i32, frame: *Frame) !?*Attribute {
             // the bridge.indexed handles this, so if we want
@@ -723,7 +756,7 @@ fn formatAttribute(name: []const u8, value: []const u8, writer: *std.Io.Writer) 
     }
 
     try writer.writeByte('"');
-    const offset = std.mem.indexOfAny(u8, value, "`' &\"<>=") orelse {
+    const offset = std.mem.findAny(u8, value, "&\"<>\xc2") orelse {
         try writer.writeAll(value);
         return writer.writeByte('"');
     };
@@ -766,32 +799,47 @@ const boolean_attributes_lookup = std.StaticStringMap(void).initComptime(blk: {
 fn writeEscapedAttributeValue(value: []const u8, first_offset: usize, writer: *std.Io.Writer) !void {
     // Write everything before the first special character
     try writer.writeAll(value[0..first_offset]);
-    try writer.writeAll(switch (value[first_offset]) {
-        '&' => "&amp;",
-        '"' => "&quot;",
-        '<' => "&lt;",
-        '>' => "&gt;",
-        '=' => "=",
-        ' ' => " ",
-        '`' => "`",
-        '\'' => "'",
-        else => unreachable,
-    });
 
-    var remaining = value[first_offset + 1 ..];
-    while (std.mem.indexOfAny(u8, remaining, "&\"<>")) |offset| {
+    var remaining = value[first_offset..];
+    while (std.mem.findAny(u8, remaining, "&\"<>\xc2")) |offset| {
         try writer.writeAll(remaining[0..offset]);
-        try writer.writeAll(switch (remaining[offset]) {
+        const escaped: []const u8 = switch (remaining[offset]) {
             '&' => "&amp;",
             '"' => "&quot;",
             '<' => "&lt;",
             '>' => "&gt;",
+            0xC2 => {
+                // non breaking space (U+00A0, C2 A0 in UTF-8)
+                if (remaining.len > offset + 1 and remaining[offset + 1] == 0xA0) {
+                    try writer.writeAll("&nbsp;");
+                    remaining = remaining[offset + 2 ..];
+                } else {
+                    try writer.writeByte(0xC2);
+                    remaining = remaining[offset + 1 ..];
+                }
+                continue;
+            },
             else => unreachable,
-        });
+        };
+        try writer.writeAll(escaped);
         remaining = remaining[offset + 1 ..];
     }
 
     if (remaining.len > 0) {
         try writer.writeAll(remaining);
     }
+}
+
+const testing = @import("../../../testing.zig");
+test "Attribute: needsLowerCasing" {
+    try testing.expectEqual(false, needsLowerCasing(""));
+    try testing.expectEqual(false, needsLowerCasing("data-x"));
+    try testing.expectEqual(true, needsLowerCasing("data-X"));
+
+    // longer than any vector: '@' and '[' sit just outside 'A'...'Z'
+    const long = "access-control-allow-origin-0123456789-@[`{-access-control-allow-origin";
+    try testing.expectEqual(false, needsLowerCasing(long));
+    try testing.expectEqual(true, needsLowerCasing("A" ++ long));
+    try testing.expectEqual(true, needsLowerCasing(long ++ "Z"));
+    try testing.expectEqual(true, needsLowerCasing(long[0..20] ++ "M" ++ long[20..]));
 }

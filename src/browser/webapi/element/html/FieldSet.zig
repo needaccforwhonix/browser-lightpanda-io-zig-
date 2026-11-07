@@ -1,8 +1,30 @@
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+//
+// Francis Bouvier <francis@lightpanda.io>
+// Pierre Tachoire <pierre@lightpanda.io>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+
 const lp = @import("lightpanda");
-const Factory = @import("../../../Factory.zig");
+
 const js = @import("../../../js/js.zig");
+const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
+
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
+const collections = @import("../../collections.zig");
+
 const HtmlElement = @import("../Html.zig");
 
 const FieldSet = @This();
@@ -19,12 +41,15 @@ pub fn asNode(self: *FieldSet) *Node {
     return self.asElement().asNode();
 }
 
+fn getElements(self: *FieldSet, frame: *Frame) collections.NodeLive(.listed) {
+    return collections.NodeLive(.listed).init(self.asNode(), {}, frame);
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(FieldSet);
 
     pub const Meta = struct {
         pub const name = "HTMLFieldSetElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -32,6 +57,8 @@ pub const JsApi = struct {
 
     pub const disabled = reflect.boolean("disabled");
     pub const name = reflect.string("name");
+    pub const @"type" = bridge.property("fieldset", .{ .template = false, .readonly = true });
+    pub const elements = bridge.accessor(FieldSet.getElements, null, .{});
 };
 
 const testing = @import("../../../../testing.zig");

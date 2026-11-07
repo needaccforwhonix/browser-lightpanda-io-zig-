@@ -26,9 +26,9 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const ArenaPool = @import("ArenaPool.zig");
+const ArenaAllocator = @import("ArenaAllocator.zig");
 
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Arena = @This();
 
@@ -63,7 +63,8 @@ account: ?*Account,
 // `bytes` as of the last report() — what the account has already been told.
 reported: usize,
 
-debug: if (lp.IS_DEBUG) []const u8 else void = if (lp.IS_DEBUG) "" else {},
+// Always a static string. Used for more useful assert messages
+debug: []const u8 = "",
 
 pub fn allocator(self: *Arena) Allocator {
     return self._arena.allocator();
@@ -109,8 +110,8 @@ pub fn dupe(self: *Arena, comptime T: type, m: []const T) ![]T {
     return self.allocator().dupe(T, m);
 }
 
-pub fn dupeZ(self: *Arena, comptime T: type, m: []const T) ![:0]T {
-    return self.allocator().dupeZ(T, m);
+pub fn dupeSentinel(self: *Arena, comptime T: type, m: []const T, comptime sentinel: T) ![:sentinel]T {
+    return self.allocator().dupeSentinel(T, m, sentinel);
 }
 
 // Arena is being released. Account goes back to 0 (everything is being released)

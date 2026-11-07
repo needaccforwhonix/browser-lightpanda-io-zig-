@@ -60,6 +60,35 @@ pub fn isNativeError(self: Value) bool {
     return v8.v8__Value__IsNativeError(self.handle);
 }
 
+pub const ErrorLocation = struct {
+    url: []const u8 = "",
+    line: u32 = 0,
+    column: u32 = 0,
+};
+
+pub fn errorLocation(self: Value, allocator: Allocator) !ErrorLocation {
+    const l = self.local;
+    const message = v8.v8__Exception__CreateMessage(l.isolate.handle, self.handle) orelse return .{};
+
+    var location: ErrorLocation = .{};
+    const line = v8.v8__Message__GetLineNumber(message, l.handle);
+    if (line > 0) {
+        location.line = @intCast(line);
+    }
+    // V8's column is 0-based.
+    const column = v8.v8__Message__GetStartColumn(message);
+    if (column >= 0) {
+        location.column = @intCast(column + 1);
+    }
+    if (v8.v8__Message__GetScriptResourceName(message)) |handle| {
+        const name: Value = .{ .local = l, .handle = handle };
+        if (name.isString()) |str| {
+            location.url = try str.toSliceWithAlloc(allocator);
+        }
+    }
+    return location;
+}
+
 pub fn isNull(self: Value) bool {
     return v8.v8__Value__IsNull(self.handle);
 }
@@ -124,7 +153,25 @@ pub fn isArrayBuffer(self: Value) bool {
     return v8.v8__Value__IsArrayBuffer(self.handle);
 }
 
-pub fn taggedOpaque(self: Value) ?*const TaggedOpaque {
+pub fn isSharedArrayBuffer(self: Value) bool {
+    return v8.v8__Value__IsSharedArrayBuffer(self.handle);
+}
+
+/// Whether this converts to a WebIDL BufferSource: an ArrayBuffer, or a view
+/// onto one. Without [AllowShared], a SharedArrayBuffer, or a view onto one,
+/// doesn't.
+pub fn isBufferSource(self: Value) bool {
+    if (self.isArrayBuffer()) {
+        return true;
+    }
+    if (!self.isArrayBufferView()) {
+        return false;
+    }
+    const view: *const v8.ArrayBufferView = @ptrCast(self.handle);
+    return !js.arrayBufferIsShared(v8.v8__ArrayBufferView__Buffer(view).?);
+}
+
+pub fn taggedOpaque(self: Value) ?TaggedOpaque {
     // caller must ensure self.isObject()
     return TaggedOpaque.fromObject(@ptrCast(self.handle));
 }
@@ -275,11 +322,6 @@ pub fn toBool(self: Value) bool {
     return v8.v8__Value__BooleanValue(self.handle, self.local.isolate.handle);
 }
 
-pub fn typeOf(self: Value) js.String {
-    const str_handle = v8.v8__Value__TypeOf(self.handle, self.local.isolate.handle).?;
-    return js.String{ .local = self.local, .handle = str_handle };
-}
-
 pub fn toF16(self: Value) !f16 {
     return @floatCast(try self.toF64());
 }
@@ -355,34 +397,30 @@ pub fn toStringSliceWithAlloc(self: Value, allocator: Allocator) ![]u8 {
     return (try self.toString()).toSliceWithAlloc(allocator);
 }
 
-pub fn toJson(self: Value, allocator: Allocator) ![]u8 {
+/// `JSON.stringify(self)`, or null where that returns undefined: undefined, a
+/// function, a symbol, or a `toJSON` that returns one of those.
+pub fn toJson(self: Value, allocator: Allocator) !?[]u8 {
     const local = self.local;
     const str_handle = v8.v8__JSON__Stringify(local.handle, self.handle, null) orelse return error.JsException;
-    return js.String.toSliceWithAlloc(.{ .local = local, .handle = str_handle }, allocator);
+    const json = try js.String.toSliceWithAlloc(.{ .local = local, .handle = str_handle }, allocator);
+    // V8 coerces JSON.stringify's undefined to the string "undefined", which
+    // no JSON text can be.
+    return if (std.mem.eql(u8, json, "undefined")) null else json;
 }
 
 pub fn jsonStringify(self: Value, jws: anytype) !void {
     const local = self.local;
-    const v = self.toJson(local.call_arena) catch return error.WriteFailed;
-    // V8's JSON::Stringify finishes by calling Object::ToString on whatever
-    // i::JsonStringify returns. For values that JSON.stringify treats as
-    // non-serializable at the top level (undefined, functions, symbols),
-    // i::JsonStringify yields the undefined sentinel, and ToString coerces
-    // it to the JS string "undefined". Writing those 9 bytes raw embeds a
-    // bare `undefined` token into the JSON stream — invalid per RFC 8259.
-    // Map that case to `null`, matching what JSON.stringify emits when an
-    // unserializable value sits in an array slot.
-    if (std.mem.eql(u8, v, "undefined")) {
-        return jws.write(null);
-    }
+    // Unserializable at the top level: write what JSON.stringify emits for
+    // one in an array slot.
+    const v = (self.toJson(local.call_arena) catch return error.WriteFailed) orelse return jws.write(null);
     jws.beginWriteRaw() catch return error.WriteFailed;
     jws.writer.writeAll(v) catch return error.WriteFailed;
     jws.endWriteRaw();
 }
 
 // Clones host objects listed in cloneable_types; throws a DataCloneError for
-// any other. Does not support transferables which require additional delegate
-// callbacks.
+// any other. Transferring MessagePorts goes through serializeTransfer /
+// deserializeTransfer (see MessagePort.cloneMessage).
 pub fn structuredClone(self: Value) !Value {
     return self.structuredCloneTo(self.local);
 }
@@ -413,9 +451,17 @@ pub const Serialized = struct {
 // Serialize `self` into a V8-owned buffer. The caller must call deinit on the
 // result. Raises a JS exception (DataCloneError) for unserializable values.
 pub fn serialize(self: Value) !Serialized {
+    return self.serializeTransfer(&.{});
+}
+
+// Like serialize, but each MessagePort in `transfer` is written as its index
+// in that list, for deserializeTransfer to swap in the moved port. A port not
+// in `transfer` is still a DataCloneError.
+pub fn serializeTransfer(self: Value, transfer: []const *MessagePort) !Serialized {
     var delegate_ctx = CloneDelegate.SerializeContext{
         .local = self.local,
         .serializer = undefined,
+        .transfer = transfer,
     };
     const serializer = v8.v8__ValueSerializer__New(self.local.isolate.handle, &.{
         .data = &delegate_ctx,
@@ -443,9 +489,16 @@ pub fn serialize(self: Value) !Serialized {
 // Deserialize a structured-serialized buffer (from `serialize`) into a value in
 // `local`'s context. A malformed buffer surfaces as error.JsException.
 pub fn deserialize(local: *const js.Local, bytes: []const u8) !Value {
+    return deserializeTransfer(local, bytes, &.{});
+}
+
+// `ports` are the transferred ports, already moved into `local`'s context, in
+// the order of the `transfer` list given to serializeTransfer.
+pub fn deserializeTransfer(local: *const js.Local, bytes: []const u8, ports: []const *MessagePort) !Value {
     var delegate_ctx = CloneDelegate.DeserializeContext{
         .local = local,
         .deserializer = undefined,
+        .ports = ports,
     };
     const deserializer = v8.v8__ValueDeserializer__New(local.isolate.handle, bytes.ptr, bytes.len, &.{
         .data = &delegate_ctx,
@@ -477,7 +530,29 @@ const cloneable_types = .{
     @import("../webapi/DOMPoint.zig"),
     @import("../webapi/DOMRectReadOnly.zig"),
     @import("../webapi/DOMRect.zig"),
+    @import("../webapi/DOMException.zig"),
+    @import("../webapi/webcodecs/encoded_chunk.zig").EncodedAudioChunk,
+    @import("../webapi/webcodecs/encoded_chunk.zig").EncodedVideoChunk,
+    @import("../webapi/webcodecs/AudioData.zig"),
+    @import("../webapi/webcodecs/VideoFrame.zig"),
+    @import("../webapi/CryptoKey.zig"),
 };
+
+const MessagePort = @import("../webapi/MessagePort.zig");
+
+// Tag for a transferred MessagePort, after the cloneable_types tags.
+const transferred_port_tag: u32 = cloneable_types.len;
+
+comptime {
+    // writeHostObject relies on subtypes coming after their prototypes.
+    for (0..cloneable_types.len) |i| {
+        for (i + 1..cloneable_types.len) |j| {
+            if (bridge.inheritsOrIs(cloneable_types[i].JsApi, cloneable_types[j].JsApi)) {
+                @compileError(@typeName(cloneable_types[i]) ++ " must come after " ++ @typeName(cloneable_types[j]));
+            }
+        }
+    }
+}
 
 // Passed to a type's structuredSerialize hook to write its payload into the
 // V8 serialization buffer.
@@ -542,11 +617,13 @@ const CloneDelegate = struct {
     const SerializeContext = struct {
         local: *const js.Local,
         serializer: *v8.ValueSerializer,
+        transfer: []const *MessagePort,
     };
 
     const DeserializeContext = struct {
         local: *const js.Local,
         deserializer: *v8.ValueDeserializer,
+        ports: []const *MessagePort,
     };
 
     // Called when V8 encounters an object with embedder fields, i.e. one of
@@ -560,18 +637,19 @@ const CloneDelegate = struct {
             const obj = object orelse break :blk;
             const tao = TaggedOpaque.fromObject(obj) orelse break :blk;
 
-            const prototype_chain = tao.prototype_chain[0..tao.prototype_len];
-            if (writeCloneable(ctx, prototype_chain[0].index, tao.value)) |result| {
-                return result;
+            if (tao.as(MessagePort)) |port| {
+                const index = std.mem.findScalar(*MessagePort, ctx.transfer, port) orelse break :blk;
+                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, transferred_port_tag);
+                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, @intCast(index));
+                return .{ .has_value = true, .value = true };
             }
 
-            // Walk up the prototype chain so a subtype serializes as its
-            // closest cloneable supertype (mirrors TaggedOpaque.fromJS).
-            var ptr = @intFromPtr(tao.value);
-            for (prototype_chain[1..]) |proto| {
-                ptr -= proto.offset;
-                if (writeCloneable(ctx, proto.index, @ptrFromInt(ptr))) |result| {
-                    return result;
+            // Serialize as the closest cloneable type: subtypes are listed
+            // after their prototypes, so the last match is the closest.
+            inline for (0..cloneable_types.len) |i| {
+                const tag = cloneable_types.len - 1 - i;
+                if (tao.as(cloneable_types[tag])) |instance| {
+                    return writeCloneable(ctx, tag, instance);
                 }
             }
         }
@@ -580,24 +658,14 @@ const CloneDelegate = struct {
         return .{ .has_value = true, .value = false };
     }
 
-    fn writeCloneable(
-        ctx: *SerializeContext,
-        type_index: bridge.JsApiLookup.BackingInt,
-        value_ptr: *anyopaque,
-    ) ?v8.MaybeBool {
-        inline for (cloneable_types, 0..) |T, tag| {
-            if (type_index == bridge.JsApiLookup.getId(T.JsApi)) {
-                v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
-                var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
-                const instance: *const T = @ptrCast(@alignCast(value_ptr));
-                instance.structuredSerialize(&writer) catch {
-                    throwDataCloneException(ctx.local, null);
-                    return .{ .has_value = true, .value = false };
-                };
-                return .{ .has_value = true, .value = true };
-            }
-        }
-        return null;
+    fn writeCloneable(ctx: *SerializeContext, tag: u32, instance: anytype) v8.MaybeBool {
+        v8.v8__ValueSerializer__WriteUint32(ctx.serializer, tag);
+        var writer = StructuredWriter{ .local = ctx.local, .serializer = ctx.serializer };
+        instance.structuredSerialize(&writer) catch {
+            throwDataCloneException(ctx.local, null);
+            return .{ .has_value = true, .value = false };
+        };
+        return .{ .has_value = true, .value = true };
     }
 
     // Called by V8 to read back what writeHostObject wrote. Returning null
@@ -608,6 +676,12 @@ const CloneDelegate = struct {
 
         var tag: u32 = undefined;
         if (v8.v8__ValueDeserializer__ReadUint32(ctx.deserializer, &tag)) {
+            if (tag == transferred_port_tag) {
+                return readTransferredPort(ctx) orelse {
+                    throwDataCloneException(local, null);
+                    return null;
+                };
+            }
             var reader = StructuredReader{ .local = local, .deserializer = ctx.deserializer };
             inline for (cloneable_types, 0..) |T, i| {
                 if (tag == i) {
@@ -621,6 +695,18 @@ const CloneDelegate = struct {
 
         throwDataCloneException(local, null);
         return null;
+    }
+
+    fn readTransferredPort(ctx: *DeserializeContext) ?*const v8.Object {
+        var index: u32 = undefined;
+        if (!v8.v8__ValueDeserializer__ReadUint32(ctx.deserializer, &index)) {
+            return null;
+        }
+        if (index >= ctx.ports.len) {
+            return null;
+        }
+        const js_obj = ctx.local.mapZigInstanceToJs(null, ctx.ports[index]) catch return null;
+        return js_obj.handle;
     }
 
     fn readCloneable(comptime T: type, reader: *StructuredReader) ?*const v8.Object {
@@ -638,8 +724,7 @@ const CloneDelegate = struct {
         const msg: ?[]const u8 = blk: {
             const handle = message orelse break :blk null;
             const str = js.String{ .local = local, .handle = handle };
-            // the exception can outlive this call; dupe onto the context arena
-            break :blk str.toSliceWithAlloc(local.ctx.arena.allocator()) catch null;
+            break :blk str.toSliceWithAlloc(local.ctx.identity_arena) catch null;
         };
         throwDataCloneException(local, msg);
     }
@@ -718,12 +803,187 @@ pub fn toBigInt(self: Value) js.BigInt {
 }
 
 pub fn format(self: Value, writer: *std.Io.Writer) !void {
-    if (comptime lp.IS_DEBUG) {
-        return self.local.debugValue(self, writer);
-    }
-    const js_str = self.toString() catch return error.WriteFailed;
-    return js_str.format(writer);
+    const inert: Inert = .{ .value = self };
+    return inert.format(writer);
 }
+
+// Stringify without running JS, avoiding potential side effects (e.g. getters,
+// proxies, ...).
+const Inert = struct {
+    value: Value,
+
+    const max_array_depth = 32;
+    const max_array_items = 1_000;
+
+    pub fn format(self: Inert, writer: *std.Io.Writer) !void {
+        const local = self.value.local;
+        // We might still end up calling an interceptor via
+        // GetOwnPropertyDescriptor, which can throw.
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(local);
+        defer try_catch.deinit();
+
+        var state: State = .{ .local = local };
+        return state.write(self.value.handle, writer);
+    }
+
+    const State = struct {
+        depth: u32 = 0,
+        local: *const js.Local,
+        items_left: u32 = max_array_items,
+        arrays: [max_array_depth]*const v8.Value = undefined,
+
+        fn write(self: *State, handle: *const v8.Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const local = self.local;
+            const isolate = local.isolate.handle;
+
+            if (v8.v8__Value__IsString(handle)) {
+                return self.writeString(@ptrCast(handle), writer);
+            }
+            if (v8.v8__Value__IsStringObject(handle)) {
+                return self.writeString(v8.v8__StringObject__ValueOf(@ptrCast(handle)).?, writer);
+            }
+            if (v8.v8__Value__IsNumberObject(handle)) {
+                return self.write(@ptrCast(v8.v8__Number__New(isolate, v8.v8__NumberObject__ValueOf(@ptrCast(handle))).?), writer);
+            }
+            if (v8.v8__Value__IsBooleanObject(handle)) {
+                return writer.writeAll(if (v8.v8__BooleanObject__ValueOf(@ptrCast(handle))) "true" else "false");
+            }
+            if (v8.v8__Value__IsBigIntObject(handle)) {
+                return self.write(@ptrCast(v8.v8__BigIntObject__ValueOf(@ptrCast(handle)).?), writer);
+            }
+            if (v8.v8__Value__IsSymbolObject(handle)) {
+                return self.write(@ptrCast(v8.v8__SymbolObject__ValueOf(@ptrCast(handle)).?), writer);
+            }
+            if (v8.v8__Value__IsSymbol(handle)) {
+                try writer.writeAll("Symbol(");
+                const description = v8.v8__Symbol__Description(@ptrCast(handle), isolate).?;
+                if (v8.v8__Value__IsString(description)) {
+                    try self.writeString(@ptrCast(description), writer);
+                }
+                return writer.writeByte(')');
+            }
+            if (v8.v8__Value__IsArray(handle)) {
+                return self.writeArray(handle, writer);
+            }
+            if (v8.v8__Value__IsProxy(handle)) {
+                return writer.writeAll("[object Proxy]");
+            }
+            if (v8.v8__Value__IsDate(handle)) {
+                return self.writeString(v8.v8__Date__ToISOString(@ptrCast(handle)).?, writer);
+            }
+            if (v8.v8__Value__IsRegExp(handle)) {
+                try writer.writeByte('/');
+                try self.writeString(v8.v8__RegExp__GetSource(@ptrCast(handle)).?, writer);
+                try writer.writeByte('/');
+                const flags: u32 = @intCast(v8.v8__RegExp__GetFlags(@ptrCast(handle)));
+                for (regexp_flags) |flag| {
+                    if (flags & flag[0] != 0) {
+                        try writer.writeByte(flag[1]);
+                    }
+                }
+                return;
+            }
+            if (v8.v8__Value__IsFunction(handle)) {
+                const source = v8.v8__Function__FunctionProtoToString(@ptrCast(handle), local.handle) orelse {
+                    return writer.writeAll("function");
+                };
+                return self.writeString(source, writer);
+            }
+            if (v8.v8__Value__IsNativeError(handle)) {
+                try self.writeString(v8.v8__Object__GetConstructorName(@ptrCast(handle)).?, writer);
+                const message = self.ownDataProperty(@ptrCast(handle), "message") orelse return;
+                if (v8.v8__Value__IsUndefined(message)) {
+                    return;
+                }
+                if (v8.v8__Value__IsString(message) and v8.v8__String__Length(@ptrCast(message)) == 0) {
+                    return;
+                }
+                try writer.writeAll(": ");
+                return self.write(message, writer);
+            }
+            if (v8.v8__Value__IsObject(handle)) {
+                try writer.writeAll("[object ");
+                try self.writeString(v8.v8__Object__GetConstructorName(@ptrCast(handle)).?, writer);
+                return writer.writeByte(']');
+            }
+
+            // number, bigint, boolean, null, undefined: converting a primitive runs no JS
+            const str = v8.v8__Value__ToString(handle, local.handle) orelse return error.WriteFailed;
+            try self.writeString(str, writer);
+            if (v8.v8__Value__IsBigInt(handle)) {
+                try writer.writeByte('n');
+            }
+        }
+
+        fn writeArray(self: *State, handle: *const v8.Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (self.arrays[0..self.depth]) |seen| {
+                if (v8.v8__Value__StrictEquals(seen, handle)) {
+                    return;
+                }
+            }
+
+            const len = v8.v8__Array__Length(@ptrCast(handle));
+            if (len > self.items_left or self.depth == max_array_depth) {
+                // V8's builder drops the whole message here; a summary keeps the rest.
+                return writer.print("Array({d})", .{len});
+            }
+            self.items_left -= len;
+            self.arrays[self.depth] = handle;
+            self.depth += 1;
+            defer self.depth -= 1;
+
+            var key_buf: [10]u8 = undefined;
+            for (0..len) |i| {
+                if (i != 0) {
+                    try writer.writeByte(',');
+                }
+                const key = std.mem.print(&key_buf, "{d}", .{i}) catch unreachable;
+                const element = self.ownDataProperty(@ptrCast(handle), key) orelse continue;
+                if (v8.v8__Value__IsNullOrUndefined(element)) {
+                    continue;
+                }
+                try self.write(element, writer);
+            }
+        }
+
+        fn writeString(self: *State, handle: *const v8.String, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const str: js.String = .{ .local = self.local, .handle = handle };
+            return str.format(writer);
+        }
+
+        fn ownDataProperty(self: *State, object: *const v8.Object, key: []const u8) ?*const v8.Value {
+            const local = self.local;
+            const key_handle = local.isolate.initStringHandle(key) catch return null;
+            const descriptor = v8.v8__Object__GetOwnPropertyDescriptor(object, local.handle, key_handle) orelse return null;
+            if (v8.v8__Value__IsObject(descriptor) == false) {
+                return null;
+            }
+
+            // An accessor descriptor has no own `value`, and a Get would then reach Object.prototype.
+            const value_key = local.isolate.initStringHandle("value") catch return null;
+            var has: v8.MaybeBool = undefined;
+            v8.v8__Object__HasOwnProperty(@ptrCast(descriptor), local.handle, value_key, &has);
+            if (has.has_value == false or has.value == false) {
+                return null;
+            }
+            return v8.v8__Object__Get(@ptrCast(descriptor), local.handle, value_key);
+        }
+    };
+
+    // Same order as RegExp.prototype.flags, plus V8's `l`.
+    const regexp_flags = [_]struct { u32, u8 }{
+        .{ v8.kRegExpHasIndices, 'd' },
+        .{ v8.kRegExpGlobal, 'g' },
+        .{ v8.kRegExpIgnoreCase, 'i' },
+        .{ v8.kRegExpLinear, 'l' },
+        .{ v8.kRegExpMultiline, 'm' },
+        .{ v8.kRegExpDotAll, 's' },
+        .{ v8.kRegExpUnicode, 'u' },
+        .{ v8.kRegExpUnicodeSets, 'v' },
+        .{ v8.kRegExpSticky, 'y' },
+    };
+};
 
 // The JS iteration protocol (@@iterator)
 pub fn iterator(self: Value) !?Iterator {
@@ -791,6 +1051,62 @@ pub const Global = struct {
 };
 
 const testing = @import("../../testing.zig");
+test "Value: inert formatting runs no page JS" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    _ = try ls.local.exec(
+        \\globalThis.probed = 0;
+        \\globalThis.probe = function() { globalThis.probed++; return 'probed'; };
+    , null);
+
+    const cases = [_]struct { expr: []const u8, expected: []const u8 }{
+        .{ .expr = "'str'", .expected = "str" },
+        .{ .expr = "1.5", .expected = "1.5" },
+        .{ .expr = "-0", .expected = "0" },
+        .{ .expr = "NaN", .expected = "NaN" },
+        .{ .expr = "true", .expected = "true" },
+        .{ .expr = "null", .expected = "null" },
+        .{ .expr = "undefined", .expected = "undefined" },
+        .{ .expr = "10n", .expected = "10n" },
+        .{ .expr = "Symbol('s')", .expected = "Symbol(s)" },
+        .{ .expr = "Symbol()", .expected = "Symbol()" },
+        .{ .expr = "new Number(42)", .expected = "42" },
+        .{ .expr = "new String('w')", .expected = "w" },
+        .{ .expr = "new Boolean(false)", .expected = "false" },
+        .{ .expr = "Object(5n)", .expected = "5n" },
+        .{ .expr = "Object(Symbol('q'))", .expected = "Symbol(q)" },
+        .{ .expr = "({ toString: probe, valueOf: probe, [Symbol.toPrimitive]: probe })", .expected = "[object Object]" },
+        .{ .expr = "Object.defineProperty({}, Symbol.toStringTag, { get: probe })", .expected = "[object Object]" },
+        .{ .expr = "(() => { const d = document.createElement('div'); Object.defineProperty(d, 'id', { get: probe }); return d; })()", .expected = "[object HTMLDivElement]" },
+        .{ .expr = "new (class Foo {})()", .expected = "[object Foo]" },
+        .{ .expr = "new Proxy({}, { get: probe, getOwnPropertyDescriptor: probe, getPrototypeOf: probe })", .expected = "[object Proxy]" },
+        .{ .expr = "[1, null, undefined, 'a', [2, [3]]]", .expected = "1,,,a,2,3" },
+        .{ .expr = "(() => { const a = [1]; a.push(a); return a; })()", .expected = "1," },
+        .{ .expr = "Object.defineProperty([1], 1, { get: probe })", .expected = "1," },
+        .{ .expr = "Object.assign(new TypeError('boom'), { toString: probe })", .expected = "TypeError: boom" },
+        .{ .expr = "new RangeError()", .expected = "RangeError" },
+        .{ .expr = "Object.defineProperty(new Error(), 'message', { get: probe })", .expected = "Error" },
+        .{ .expr = "Object.defineProperty(Object.assign(new Date(0), { toString: probe }), Symbol.toPrimitive, { value: probe })", .expected = "1970-01-01T00:00:00.000Z" },
+        .{ .expr = "new Date(NaN)", .expected = "Invalid Date" },
+        .{ .expr = "Object.assign(/a+/gi, { toString: probe })", .expected = "/a+/gi" },
+        .{ .expr = "Object.assign(function named() {}, { toString: probe })", .expected = "function named() {}" },
+    };
+    for (cases) |case| {
+        const value = try ls.local.exec(case.expr, null);
+        const out = try testing.allocator.print("{f}", .{value});
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, case.expected, out);
+    }
+
+    const probed = try ls.local.exec("globalThis.probed", null);
+    try testing.expectEqual(0, try probed.toF64());
+}
+
 test "Value: persisted handle early-release swap-removes and fixes up indices" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();

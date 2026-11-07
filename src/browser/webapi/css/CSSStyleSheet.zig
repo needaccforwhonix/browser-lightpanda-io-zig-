@@ -4,6 +4,7 @@ const lp = @import("lightpanda");
 const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const Parser = @import("../../css/Parser.zig");
+const StyleManager = @import("../../StyleManager.zig");
 
 const Element = @import("../Element.zig");
 
@@ -21,6 +22,7 @@ const CSSError = error{
     WriteFailed,
     StringTooLarge,
     SyntaxError,
+    NotAllowedError,
 };
 
 _href: ?[]const u8 = null,
@@ -29,9 +31,10 @@ _disabled: bool = false,
 _css_rules: ?*CSSRuleList = null,
 _owner_rule: ?*CSSRule = null,
 _owner_node: ?*Element = null,
+_constructed: bool = false, // only when true can it be replaced
 
 pub fn init(frame: *Frame) !*CSSStyleSheet {
-    return frame._factory.create(CSSStyleSheet{});
+    return frame._factory.create(CSSStyleSheet{ ._constructed = true });
 }
 
 pub fn initWithOwner(owner: *Element, frame: *Frame) !*CSSStyleSheet {
@@ -40,6 +43,11 @@ pub fn initWithOwner(owner: *Element, frame: *Frame) !*CSSStyleSheet {
 
 pub fn getOwnerNode(self: *const CSSStyleSheet) ?*Element {
     return self._owner_node;
+}
+
+fn ownerStyleManager(self: *const CSSStyleSheet, frame: *Frame) ?*StyleManager {
+    const owner = self._owner_node orelse return null;
+    return &(owner.ownerFrame(frame) orelse return null)._style_manager;
 }
 
 pub fn getHref(self: *const CSSStyleSheet) ?[]const u8 {
@@ -54,8 +62,14 @@ fn getDisabled(self: *const CSSStyleSheet) bool {
     return self._disabled;
 }
 
-fn setDisabled(self: *CSSStyleSheet, disabled: bool) void {
+pub fn setDisabled(self: *CSSStyleSheet, disabled: bool, frame: *Frame) void {
+    if (self._disabled == disabled) {
+        return;
+    }
     self._disabled = disabled;
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
 }
 
 fn getCssRules(self: *CSSStyleSheet, frame: *Frame) !*CSSRuleList {
@@ -87,15 +101,7 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
     if (it.next() != null) return error.SyntaxError;
 
     const inserted: *CSSRule = switch (parsed_rule) {
-        .style => |s| blk: {
-            const style_rule = try CSSStyleRule.init(frame);
-            try style_rule.setSelectorText(s.selector, frame);
-
-            const style_props = try style_rule.getStyle(frame);
-            const style = style_props.asCSSStyleDeclaration();
-            try style.setCssText(s.block, frame);
-            break :blk style_rule._proto;
-        },
+        .style => |s| try initStyleRule(s.selector, s.block, 0, frame),
         // Opaque placeholder for at-rules. The CSS engine doesn't apply
         // these (`@keyframes`, `@media`, ...) but JS-side reads must see
         // them via `cssRules` so CSS-in-JS libraries don't fall back to
@@ -115,9 +121,39 @@ pub fn insertRule(self: *CSSStyleSheet, rule: []const u8, maybe_index: ?u32, fra
         log.debug(.not_implemented, "insertRule clamped index", .{});
     }
     try rules.insert(index, inserted, frame);
-    frame._style_manager.ruleInserted(self, inserted);
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.ruleInserted(self, inserted);
+    }
 
     return index;
+}
+
+/// A style rule from source: its declarations, and the rules nested in its
+/// block (CSS Nesting) as child rules. `depth` caps the nesting like
+/// StyleManager's cap on the cascade side.
+fn initStyleRule(selector: []const u8, block: []const u8, depth: u8, frame: *Frame) CSSError!*CSSRule {
+    const style_rule = try CSSStyleRule.init(frame);
+    try style_rule.setSelectorText(selector, frame);
+
+    const style_props = try style_rule.getStyle(frame);
+    const style = style_props.asCSSStyleDeclaration();
+    try style.replaceStyleBlock(block, frame);
+
+    if (depth >= StyleManager.MAX_AT_RULE_NESTING or std.mem.findScalar(u8, block, '{') == null) {
+        return style_rule._proto;
+    }
+    var it = Parser.parseStyleBlock(block);
+    while (it.nextItem()) |item| {
+        const nested: *CSSRule = switch (item) {
+            .declaration => continue,
+            .rule => |r| try initStyleRule(r.selector, r.block, depth + 1, frame),
+            .at_rule => |a| try CSSRule.initAtRule(atRuleTypeFor(a.keyword), a.text, frame),
+        };
+        // Created on the first nested rule: `_rules` stays null without one.
+        const rules = try style_rule.getCssRules(frame);
+        try rules.insert(rules.length(), nested, frame);
+    }
+    return style_rule._proto;
 }
 
 /// Map an at-rule keyword (without `@`) to the matching `CSSRule.Type`
@@ -155,19 +191,34 @@ fn deleteRule(self: *CSSStyleSheet, index: u32, frame: *Frame) !void {
     try rules.remove(index);
 
     // Notify StyleManager that rules have changed
-    frame._style_manager.sheetModified();
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
 }
 
 pub fn replace(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!js.Promise {
-    try self.replaceSync(text, frame);
+    if (self._constructed == false) {
+        return error.NotAllowedError;
+    }
+    try self.replaceRules(text, frame);
     return frame.js.local.?.resolvePromise(self);
 }
 
-pub fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
+fn replaceSync(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
+    if (self._constructed == false) {
+        return error.NotAllowedError;
+    }
+    return self.replaceRules(text, frame);
+}
+
+/// replaceSync without the constructed-sheet check, for loading a <link>.
+pub fn replaceRules(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
     const rules = try self.getCssRules(frame);
     rules.clear();
     try self.parseInto(text, frame);
-    frame._style_manager.sheetModified();
+    if (self.ownerStyleManager(frame)) |style_manager| {
+        style_manager.sheetModified();
+    }
 }
 
 fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!void {
@@ -176,15 +227,7 @@ fn parseInto(self: *CSSStyleSheet, text: []const u8, frame: *Frame) CSSError!voi
     var index: u32 = 0;
     while (it.next()) |parsed_rule| {
         const inserted: *CSSRule = switch (parsed_rule) {
-            .style => |s| blk: {
-                const style_rule = try CSSStyleRule.init(frame);
-                try style_rule.setSelectorText(s.selector, frame);
-
-                const style_props = try style_rule.getStyle(frame);
-                const style = style_props.asCSSStyleDeclaration();
-                try style.setCssText(s.block, frame);
-                break :blk style_rule._proto;
-            },
+            .style => |s| try initStyleRule(s.selector, s.block, 0, frame),
             .at_rule => |a| try CSSRule.initAtRule(atRuleTypeFor(a.keyword), a.text, frame),
         };
 
@@ -198,7 +241,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "CSSStyleSheet";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -227,4 +269,8 @@ test "WebApi: layer @-rule cascade" {
 
 test "WebApi: layer order cascade" {
     try testing.htmlRunner("css/layer_order_cascade.html", .{});
+}
+
+test "WebApi: CSS nesting" {
+    try testing.htmlRunner("css/nesting.html", .{});
 }

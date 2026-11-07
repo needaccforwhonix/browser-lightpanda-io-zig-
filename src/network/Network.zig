@@ -27,6 +27,7 @@ const libcurl = @import("../sys/libcurl.zig");
 const http = @import("http.zig");
 const IpFilter = @import("IpFilter.zig");
 const RobotStore = @import("Robots.zig").RobotStore;
+const CorsStore = @import("CorsStore.zig");
 const WebBotAuth = @import("WebBotAuth.zig");
 const RateLimiter = @import("RateLimiter.zig");
 const Certificates = @import("Certificates.zig");
@@ -43,6 +44,7 @@ cache: Cache,
 allocator: Allocator,
 config: *const Config,
 robot_store: RobotStore,
+cors_store: CorsStore,
 web_bot_auth: ?WebBotAuth,
 rate_limiter: ?RateLimiter,
 certificates: Certificates,
@@ -56,6 +58,8 @@ ws_pool: std.heap.MemoryPool(http.Connection),
 ws_count: usize = 0,
 ws_max: u8,
 ws_mutex: std.Io.Mutex = .init,
+
+dns_share: *http.DnsShare,
 
 /// Optional IP filter for blocking requests to private/internal networks (--block-private-networks).
 ip_filter: ?*IpFilter = null,
@@ -90,6 +94,9 @@ pub fn init(app: *App) !Network {
         allocator.destroy(f);
     };
 
+    const dns_share = try http.DnsShare.init(allocator);
+    errdefer dns_share.deinit(allocator);
+
     const count: usize = config.httpMaxConcurrent();
     const connections = try allocator.alloc(http.Connection, count);
     errdefer allocator.free(connections);
@@ -97,6 +104,7 @@ pub fn init(app: *App) !Network {
     var available: DoublyLinkedList = .{};
     for (0..count) |i| {
         connections[i] = try http.Connection.init(certificates, config, ip_filter);
+        try connections[i].setDnsShare(dns_share);
         available.append(&connections[i].node);
     }
 
@@ -106,7 +114,7 @@ pub fn init(app: *App) !Network {
         null;
     errdefer if (web_bot_auth) |wba| wba.deinit(allocator);
 
-    var adblocker = try AdBlocker.fromConfig(allocator, config);
+    var adblocker = try AdBlocker.fromConfig(allocator, config, app.regex_context);
     errdefer if (adblocker) |*blocker| blocker.deinit();
 
     var cache = try Cache.init(allocator, config);
@@ -121,7 +129,8 @@ pub fn init(app: *App) !Network {
         .connections = connections,
 
         .cache = cache,
-        .robot_store = RobotStore.init(allocator),
+        .robot_store = RobotStore.init(allocator, config.robotStoreEntryLimit()),
+        .cors_store = CorsStore.init(allocator, config.corsStoreEntryLimit()),
         .web_bot_auth = web_bot_auth,
         .rate_limiter = if (config.httpNavDelay()) |ms| RateLimiter.init(allocator, ms, config.httpNavBurst()) else null,
         .adblocker = adblocker,
@@ -130,6 +139,7 @@ pub fn init(app: *App) !Network {
         .ws_max = config.wsMaxConcurrent(),
 
         .ip_filter = ip_filter,
+        .dns_share = dns_share,
     };
 }
 
@@ -143,7 +153,12 @@ pub fn deinit(self: *Network) void {
 
     self.ws_pool.deinit(self.allocator);
 
+    // after every easy that uses it
+    self.dns_share.deinit(self.allocator);
+
     self.robot_store.deinit();
+    self.cors_store.deinit();
+
     if (self.rate_limiter) |*rl| {
         rl.deinit();
     }
@@ -175,10 +190,7 @@ pub fn releaseConnection(self: *Network, conn: *http.Connection) void {
     switch (conn.transport) {
         .websocket => {
             conn.deinit();
-            self.ws_mutex.lockUncancelable(lp.io);
-            defer self.ws_mutex.unlock(lp.io);
-            self.ws_pool.destroy(conn);
-            self.ws_count -= 1;
+            self.destroyWsConnection(conn);
         },
         else => {
             conn.reset(self.config, self.certificates, self.ip_filter) catch |err| {
@@ -207,15 +219,23 @@ pub fn newConnection(self: *Network) ?*http.Connection {
 
     // don't do this under lock
     conn.* = http.Connection.init(self.certificates, self.config, self.ip_filter) catch {
-        self.ws_mutex.lockUncancelable(lp.io);
-        defer self.ws_mutex.unlock(lp.io);
-        self.ws_pool.destroy(conn);
-        self.ws_count -= 1;
-
+        self.destroyWsConnection(conn);
+        return null;
+    };
+    conn.setDnsShare(self.dns_share) catch {
+        conn.deinit();
+        self.destroyWsConnection(conn);
         return null;
     };
 
     return conn;
+}
+
+fn destroyWsConnection(self: *Network, conn: *http.Connection) void {
+    self.ws_mutex.lockUncancelable(lp.io);
+    defer self.ws_mutex.unlock(lp.io);
+    self.ws_pool.destroy(conn);
+    self.ws_count -= 1;
 }
 
 pub fn HostHashMap(comptime V: type) type {
@@ -247,3 +267,35 @@ const HostContext = struct {
         return std.ascii.eqlIgnoreCase(a, b);
     }
 };
+
+const testing = @import("../testing.zig");
+test "Network: easies on separate multis share one DNS cache" {
+    const network = &testing.test_app.network;
+
+    // curl_easy_perform drives each easy on its own internal multi, so without
+    // the share each would have its own DNS cache.
+    var teacher = try http.Connection.init(network.certificates, network.config, null);
+    defer teacher.deinit();
+    try teacher.setDnsShare(network.dns_share);
+
+    var learner = try http.Connection.init(network.certificates, network.config, null);
+    defer learner.deinit();
+    try learner.setDnsShare(network.dns_share);
+
+    var buf: [128]u8 = undefined;
+    // .test never resolves, so the learner only connects if it reads the
+    // entry the teacher's CURLOPT_RESOLVE put in the shared cache.
+    const url = try std.fmt.bufPrintSentinel(&buf, "http://lpshare.test:{d}/json/version", .{testing.test_cdp_port}, 0);
+
+    const entry = try std.fmt.allocPrintSentinel(testing.allocator, "lpshare.test:{d}:127.0.0.1", .{testing.test_cdp_port}, 0);
+    defer testing.allocator.free(entry);
+    const resolve = libcurl.curl_slist_append(null, entry) orelse return error.OutOfMemory;
+    defer libcurl.curl_slist_free_all(resolve);
+
+    try libcurl.curl_easy_setopt(teacher._easy, .resolve, resolve);
+    try teacher.setURL(url);
+    try testing.expectEqual(200, try teacher.perform());
+
+    try learner.setURL(url);
+    try testing.expectEqual(200, try learner.perform());
+}

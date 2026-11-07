@@ -19,6 +19,7 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const URL = @import("../browser/URL.zig");
 const Config = @import("../Config.zig");
 const sys_net = @import("../sys/net.zig");
 const libcurl = @import("../sys/libcurl.zig");
@@ -26,15 +27,20 @@ const crypto = @import("../sys/libcrypto.zig");
 
 const IpFilter = @import("IpFilter.zig");
 const Certificates = @import("Certificates.zig");
+const repeat = @import("../string.zig").repeat;
 
 const log = lp.log;
 const posix = std.posix;
+const Allocator = std.mem.Allocator;
 
-const ENABLE_DEBUG = false;
+// Tests run several processes, each with its own ephemeral test servers, while
+// fixtures keep addressing the fixed ports. Routes those to the real ones.
+pub var test_connect_to: ?*libcurl.CurlSList = null;
 
 pub const readfunc_pause = libcurl.curl_readfunc_pause;
 pub const writefunc_error = libcurl.curl_writefunc_error;
 pub const WsFrameType = libcurl.WsFrameType;
+pub const WsFrameMeta = libcurl.WsFrameMeta;
 
 const Error = libcurl.Error;
 
@@ -51,6 +57,15 @@ pub const Method = enum(u8) {
     OPTIONS = 5,
     PATCH = 6,
     PROPFIND = 7,
+
+    // The safe methods of RFC 9110 9.2.1 (we have no TRACE). PROPFIND is
+    // read-only in practice but isn't on that list.
+    pub fn isSafe(self: Method) bool {
+        return switch (self) {
+            .GET, .HEAD, .OPTIONS => true,
+            .PUT, .POST, .DELETE, .PATCH, .PROPFIND => false,
+        };
+    }
 };
 
 pub const Header = struct {
@@ -62,8 +77,15 @@ pub const Header = struct {
         value: []const u8,
     };
 
+    pub fn normalize(self: Header, allocator: Allocator) !Header {
+        return .{
+            .name = try std.ascii.allocLowerString(allocator, self.name),
+            .value = try allocator.dupe(u8, self.value),
+        };
+    }
+
     pub fn parse(header_str: []const u8) ?Header {
-        const colon_pos = std.mem.indexOfScalar(u8, header_str, ':') orelse return null;
+        const colon_pos = std.mem.findScalar(u8, header_str, ':') orelse return null;
 
         const name = std.mem.trim(u8, header_str[0..colon_pos], " \t");
         const value = std.mem.trim(u8, header_str[colon_pos + 1 ..], " \t");
@@ -74,13 +96,13 @@ pub const Header = struct {
     // The header value up to the first ';', trimmed (e.g. "attachment" for a
     // Content-Disposition, "text/html" for a Content-Type).
     pub fn firstValue(self: Header) []const u8 {
-        const end = std.mem.indexOfScalar(u8, self.value, ';') orelse self.value.len;
+        const end = std.mem.findScalar(u8, self.value, ';') orelse self.value.len;
         return std.mem.trim(u8, self.value[0..end], " \t");
     }
 
     // Iterates the `; key=value` parameters that follow the header's first value.
     pub fn params(self: Header) ParamIterator {
-        const start = std.mem.indexOfScalar(u8, self.value, ';') orelse self.value.len;
+        const start = std.mem.findScalar(u8, self.value, ';') orelse self.value.len;
         return .{ .rest = self.value[start..] };
     }
 
@@ -101,11 +123,11 @@ pub const Header = struct {
         pub fn next(self: *ParamIterator) ?Param {
             while (self.rest.len > 0 and self.rest[0] == ';') {
                 self.rest = self.rest[1..];
-                const end = std.mem.indexOfScalar(u8, self.rest, ';') orelse self.rest.len;
+                const end = std.mem.findScalar(u8, self.rest, ';') orelse self.rest.len;
                 const segment = self.rest[0..end];
                 self.rest = self.rest[end..];
 
-                const eq = std.mem.indexOfScalar(u8, segment, '=') orelse continue;
+                const eq = std.mem.findScalar(u8, segment, '=') orelse continue;
                 const key = std.mem.trim(u8, segment[0..eq], " \t");
                 if (key.len == 0) continue;
 
@@ -116,64 +138,6 @@ pub const Header = struct {
                 return .{ .key = key, .value = value };
             }
             return null;
-        }
-    };
-};
-
-// In normal cases, the header iterator comes from the curl connection.
-// But it's also possible to inject a response, via `transfer.fulfill`. In that
-// case, the response headers are a list, []const Http.Header.
-// This union, is an iterator that exposes the same API for either case.
-pub const HeaderIterator = union(enum) {
-    curl: CurlHeaderIterator,
-    list: ListHeaderIterator,
-
-    pub fn next(self: *HeaderIterator) ?Header {
-        switch (self.*) {
-            inline else => |*it| return it.next(),
-        }
-    }
-
-    pub fn collect(self: *HeaderIterator, allocator: std.mem.Allocator) !std.ArrayList(Header) {
-        var list: std.ArrayList(Header) = .empty;
-
-        while (self.next()) |hdr| {
-            try list.append(allocator, .{
-                .name = try allocator.dupe(u8, hdr.name),
-                .value = try allocator.dupe(u8, hdr.value),
-            });
-        }
-
-        return list;
-    }
-
-    const CurlHeaderIterator = struct {
-        conn: *const Connection,
-        prev: ?*libcurl.CurlHeader = null,
-
-        pub fn next(self: *CurlHeaderIterator) ?Header {
-            const h = libcurl.curl_easy_nextheader(self.conn._easy, .header, -1, self.prev) orelse return null;
-            self.prev = h;
-
-            const header = h.*;
-            return .{
-                .name = std.mem.span(header.name),
-                .value = std.mem.span(header.value),
-            };
-        }
-    };
-
-    const ListHeaderIterator = struct {
-        index: usize = 0,
-        list: []const Header,
-
-        pub fn next(self: *ListHeaderIterator) ?Header {
-            const idx = self.index;
-            if (idx == self.list.len) {
-                return null;
-            }
-            self.index = idx + 1;
-            return self.list[idx];
         }
     };
 };
@@ -201,7 +165,7 @@ pub const AuthChallenge = struct {
         };
 
         const challenge_value = std.mem.trim(u8, value, std.ascii.whitespace[0..]);
-        const pos = std.mem.indexOfPos(u8, challenge_value, 0, " ") orelse challenge_value.len;
+        const pos = std.mem.findPos(u8, challenge_value, 0, " ") orelse challenge_value.len;
         const _scheme = challenge_value[0..pos];
         if (std.ascii.eqlIgnoreCase(_scheme, "basic")) {
             ac.scheme = .basic;
@@ -212,6 +176,42 @@ pub const AuthChallenge = struct {
         }
 
         return ac;
+    }
+};
+
+// The actual reason phrase from the server, verbatim. HTTP/2 has none, so "".
+pub const StatusText = struct {
+    const MAX_LEN = 128;
+
+    _len: ?u8 = null,
+    _buf: [MAX_LEN]u8 = undefined,
+
+    pub fn fromStatusLine(line: []const u8) StatusText {
+        const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+        // HTTP-version SP status-code SP [ reason-phrase ]
+        // Like libcurl, accept a tab wherever SP is expected.
+        const sp1 = std.mem.findAny(u8, trimmed, " \t") orelse return .{ ._len = 0 };
+        const sp2 = std.mem.findAnyPos(u8, trimmed, sp1 + 1, " \t") orelse return .{ ._len = 0 };
+        const phrase = trimmed[sp2 + 1 ..];
+
+        var len: usize = @min(phrase.len, MAX_LEN);
+        if (len < phrase.len) {
+            // Don't cut a UTF-8 sequence in half
+            var back: usize = 0;
+            while (back < 3 and phrase[len - back] & 0xC0 == 0x80) : (back += 1) {}
+            if (phrase[len - back] & 0xC0 != 0x80) {
+                len -= back;
+            }
+        }
+
+        var st: StatusText = .{ ._len = @intCast(len) };
+        @memcpy(st._buf[0..len], phrase[0..len]);
+        return st;
+    }
+
+    pub fn get(self: *const StatusText) ?[]const u8 {
+        const len = self._len orelse return null;
+        return self._buf[0..len];
     }
 };
 
@@ -249,9 +249,9 @@ fn opensocketCallback(
     if (filter.isBlockedSockaddr(address)) {
         if (address.family == posix.AF.INET or address.family == posix.AF.INET6) {
             const ip = sys_net.addressFromSockaddr(@ptrCast(@alignCast(&address.addr)));
-            log.warn(.http, "blocked by IP filter", .{ .ip = ip });
+            log.debug(.http, "blocked by IP filter", .{ .ip = ip });
         } else {
-            log.warn(.http, "blocked by IP filter", .{ .family = address.family });
+            log.debug(.http, "blocked by IP filter", .{ .family = address.family });
         }
         return libcurl.CURL_SOCKET_BAD;
     }
@@ -292,6 +292,11 @@ pub const Connection = struct {
 
         try self.reset(config, certificates, ip_filter);
         return self;
+    }
+
+    // Survives curl_easy_reset, so once per easy is enough.
+    pub fn setDnsShare(self: *const Connection, share: *const DnsShare) !void {
+        try libcurl.curl_easy_setopt(self._easy, .share, share.handle);
     }
 
     pub fn deinit(self: *Connection) void {
@@ -361,11 +366,11 @@ pub const Connection = struct {
     // "name;" when the value is empty — curl reads "name:" as
     // remove-this-header and the ";" form as send-an-empty-value. curl
     // copies the string, so `allocator` only backs the transient join.
-    pub fn addHeader(self: *Connection, allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    pub fn addHeader(self: *Connection, allocator: Allocator, name: []const u8, value: []const u8) !void {
         const joined = if (value.len == 0)
-            try std.fmt.allocPrintSentinel(allocator, "{s};", .{name}, 0)
+            try allocator.printSentinel("{s};", .{name}, 0)
         else
-            try std.fmt.allocPrintSentinel(allocator, "{s}: {s}", .{ name, value }, 0);
+            try allocator.printSentinel("{s}: {s}", .{ name, value }, 0);
         return self.addRawHeader(joined);
     }
 
@@ -409,6 +414,19 @@ pub const Connection = struct {
     pub fn setConnectOnly(self: *const Connection, connect_only: bool) !void {
         const value: c_long = if (connect_only) 2 else 0;
         try libcurl.curl_easy_setopt(self._easy, .connect_only, value);
+    }
+
+    // Keep a proxy's CONNECT response out of the header callback, so it only
+    // sees the origin's.
+    pub fn setSuppressConnectHeaders(self: *const Connection) !void {
+        try libcurl.curl_easy_setopt(self._easy, .suppress_connect_headers, true);
+    }
+
+    // Close this connection when the transfer ends instead of returning it to
+    // libcurl's keepalive pool. Read by libcurl when the transfer completes,
+    // so it can be set while the response is being received.
+    pub fn setForbidReuse(self: *const Connection) !void {
+        try libcurl.curl_easy_setopt(self._easy, .forbid_reuse, true);
     }
 
     pub fn setWriteCallback(
@@ -468,6 +486,10 @@ pub const Connection = struct {
         // empty string means: use whatever's available
         try libcurl.curl_easy_setopt(self._easy, .accept_encoding, "");
 
+        if (comptime lp.IS_TEST) {
+            try libcurl.curl_easy_setopt(self._easy, .connect_to, test_connect_to);
+        }
+
         // proxy
         const http_proxy = config.httpProxy();
         if (http_proxy) |proxy| {
@@ -507,17 +529,19 @@ pub const Connection = struct {
             }
         }
 
-        // debug
-        if (comptime ENABLE_DEBUG) {
-            try libcurl.curl_easy_setopt(self._easy, .verbose, true);
-
-            // Sometimes the default debug output hides some useful data. You can
-            // uncomment the following line (BUT KEEP THE LIVE ABOVE AS-IS), to
-            // get more control over the data (specifically, the `CURLINFO_TEXT`
-            // can include useful data).
-
-            // try libcurl.curl_easy_setopt(easy, .debug_function, debugCallback);
+        if (config.httpCurves()) |list| {
+            try libcurl.curl_easy_setopt(self._easy, .ssl_ec_curves, list.ptr);
         }
+
+        if (config.httpDebug()) {
+            try libcurl.curl_easy_setopt(self._easy, .verbose, true);
+        }
+
+        // Sometimes the default debug output hides some useful data. You can
+        // uncomment the following line (BUT KEEP THE LINE ABOVE AS-IS), to
+        // get more control over the data (specifically, the `CURLINFO_TEXT`
+        // can include useful data).
+        // try libcurl.curl_easy_setopt(easy, .debug_function, debugCallback);
 
         // default write callback to prevent libcurl from writing to stdout
         try self.setWriteCallback(discardBody);
@@ -567,18 +591,19 @@ pub const Connection = struct {
     pub fn getConnectCode(self: *const Connection) !u16 {
         var status: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .connect_code, &status);
-        if (status < 0 or status > std.math.maxInt(u16)) {
-            return 0;
-        }
-        return @intCast(status);
+        return inHttpRange(status);
     }
 
     pub fn getResponseCode(self: *const Connection) !u16 {
         var status: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .response_code, &status);
-        if (status < 0 or status > std.math.maxInt(u16)) {
-            return 0;
-        }
+        return inHttpRange(status);
+    }
+
+    /// 0 outside 100..599, which is curl's own value for having no status.
+    /// Consumers cast this into `std.http.Status`, an enum(u10).
+    fn inHttpRange(status: c_long) u16 {
+        if (status < 100 or status > 599) return 0;
         return @intCast(status);
     }
 
@@ -638,10 +663,17 @@ pub const Connection = struct {
         return @intCast(@max(0, size));
     }
 
+    // Bytes of every response header received, status lines included.
+    pub fn getHeaderSize(self: *const Connection) !u64 {
+        var size: c_long = undefined;
+        try libcurl.curl_easy_getinfo(self._easy, .header_size, &size);
+        return @intCast(@max(0, size));
+    }
+
     pub fn getHttpVersion(self: *const Connection) !libcurl.CurlHttpVersion {
         var version: c_long = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .http_version, &version);
-        return @enumFromInt(version);
+        return @fromBackingInt(@intCast(version));
     }
 
     pub fn getConnectHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
@@ -660,6 +692,21 @@ pub const Connection = struct {
             .amount = h.amount,
             .value = std.mem.span(h.value),
         };
+    }
+
+    // Copies the response headers, names lowercased, into `allocator`.
+    pub fn collectResponseHeaders(self: *const Connection, allocator: Allocator) ![]const Header {
+        var list: std.ArrayList(Header) = .empty;
+        var prev: ?*libcurl.CurlHeader = null;
+        while (libcurl.curl_easy_nextheader(self._easy, .header, -1, prev)) |h| {
+            prev = h;
+            const hdr: Header = .{
+                .name = std.mem.span(h.name),
+                .value = std.mem.span(h.value),
+            };
+            try list.append(allocator, try hdr.normalize(allocator));
+        }
+        return list.items;
     }
 
     pub fn getResponseHeader(self: *const Connection, name: [:0]const u8, index: usize) ?HeaderValue {
@@ -698,8 +745,62 @@ pub const Connection = struct {
         try libcurl.curl_ws_start_frame(self._easy, frame_type, @intCast(size));
     }
 
-    pub fn wsMeta(self: *const Connection) ?libcurl.WsFrameMeta {
+    pub fn wsMeta(self: *const Connection) ?WsFrameMeta {
         return libcurl.curl_ws_meta(self._easy);
+    }
+};
+
+// A DNS cache, using curl_share. Connection sharing isn't support and TLS
+// is limited to 25 hosts (so caching it would be worse than then 25 host per
+// multi we currently have).
+pub const DnsShare = struct {
+    handle: *libcurl.CurlSH,
+    dns_mutex: std.Io.Mutex = .init,
+    share_mutex: std.Io.Mutex = .init,
+
+    pub fn init(allocator: Allocator) !*DnsShare {
+        // needs to be on the heap, libcurl takes the address as user_data
+        const self = try allocator.create(DnsShare);
+        errdefer allocator.destroy(self);
+
+        const handle = libcurl.curl_share_init() orelse return error.FailedToInitializeShare;
+        errdefer libcurl.curl_share_cleanup(handle) catch {};
+
+        self.* = .{ .handle = handle };
+        try libcurl.curl_share_setopt(handle, .share, .dns);
+        try libcurl.curl_share_setopt(handle, .lock_function, &lock);
+        try libcurl.curl_share_setopt(handle, .unlock_function, &unlock);
+        try libcurl.curl_share_setopt(handle, .user_data, self);
+        return self;
+    }
+
+    // Every easy using the share must be cleaned up first.
+    pub fn deinit(self: *DnsShare, allocator: Allocator) void {
+        libcurl.curl_share_cleanup(self.handle) catch |err| {
+            // An easy still points at us: leak rather than free under it.
+            log.err(.http, "curl_share_cleanup", .{ .err = err });
+            return;
+        };
+        allocator.destroy(self);
+    }
+
+    fn lock(_: ?*libcurl.Curl, data: libcurl.CurlLockData, _: libcurl.CurlLockAccess, ptr: ?*anyopaque) callconv(.c) void {
+        const self: *DnsShare = @ptrCast(@alignCast(ptr));
+        self.mutexFor(data).lockUncancelable(lp.io);
+    }
+
+    fn unlock(_: ?*libcurl.Curl, data: libcurl.CurlLockData, ptr: ?*anyopaque) callconv(.c) void {
+        const self: *DnsShare = @ptrCast(@alignCast(ptr));
+        self.mutexFor(data).unlock(lp.io);
+    }
+
+    fn mutexFor(self: *DnsShare, data: libcurl.CurlLockData) *std.Io.Mutex {
+        return switch (data) {
+            .dns => &self.dns_mutex,
+            .share => &self.share_mutex,
+            // curl only locks the types we share
+            _ => unreachable,
+        };
     }
 };
 
@@ -711,9 +812,12 @@ pub const Handles = struct {
         errdefer libcurl.curl_multi_cleanup(multi) catch {};
 
         try libcurl.curl_multi_setopt(multi, .max_host_connections, config.httpMaxHostOpen());
-        // Default is 4x the attached easy handles, i.e. ~0 between page loads,
-        // so keepalive connections were evicted on every cross-site navigation.
-        try libcurl.curl_multi_setopt(multi, .max_connects, 4 * @as(u32, config.httpMaxConcurrent()));
+        // --http-max-concurrent is dynamic (based on --cdp-max-connections in
+        // serve), so we don't want this to be based on that, since it could
+        // result in an unexpected large # of keepalive connection. Instead, we
+        // hard-code 160, which used to be the default when --cdp-max-connections
+        // was fixed (and it seemed to be safe/work well, so why mess with it?)
+        try libcurl.curl_multi_setopt(multi, .max_connects, 160);
 
         return .{ .multi = multi };
     }
@@ -785,8 +889,19 @@ pub fn statusCategory(status: u16) StatusCategory {
     };
 }
 
+// A url whose explicit port is one of the Fetch "bad ports". No port means
+// the scheme's default, which never is. An unparsable or out-of-range port is
+// left to the transport to reject.
+pub fn isBadPortUrl(url: []const u8) bool {
+    const port = URL.getPort(url);
+    if (port.len == 0) {
+        return false;
+    }
+    return isBadPort(std.fmt.parseInt(u16, port, 10) catch return false);
+}
+
 // https://fetch.spec.whatwg.org/#bad-port
-pub fn isBadPort(port: u16) bool {
+fn isBadPort(port: u16) bool {
     return switch (port) {
         1, // tcpmux
         7, // echo
@@ -884,6 +999,7 @@ pub const ErrorReason = enum {
     too_large,
     aborted,
     robots_blocked,
+    bot_challenge,
     other,
 };
 
@@ -912,6 +1028,7 @@ pub fn errorReason(err: anyerror) ErrorReason {
         error.SyncWaitInterrupted,
         => .aborted,
         error.RobotsBlocked => .robots_blocked,
+        error.BotChallenge => .bot_challenge,
         else => .other,
     };
 }
@@ -955,6 +1072,20 @@ test "isBadPort" {
     for ([_]u16{ 0, 80, 443, 8000, 8080, 9584, 65535 }) |port| {
         try testing.expect(!isBadPort(port));
     }
+}
+
+test "isBadPortUrl" {
+    try testing.expect(isBadPortUrl("http://example.com:22/"));
+    try testing.expect(isBadPortUrl("https://example.com:25/x"));
+    try testing.expect(isBadPortUrl("ws://example.com:5060/"));
+    try testing.expect(isBadPortUrl("http://[::1]:110/"));
+
+    try testing.expect(!isBadPortUrl("http://example.com/"));
+    try testing.expect(!isBadPortUrl("https://example.com:443/"));
+    try testing.expect(!isBadPortUrl("ws://127.0.0.1:9584/"));
+    try testing.expect(!isBadPortUrl("http://[::1]/"));
+    try testing.expect(!isBadPortUrl("http://example.com:abc/"));
+    try testing.expect(!isBadPortUrl("http://example.com:99999/"));
 }
 
 test "Header.parse" {
@@ -1021,12 +1152,32 @@ test "Header.param" {
     try testing.expect((Header{ .name = "Content-Disposition", .value = "attachment; filename=\"\"" }).param("filename") == null);
 }
 
+test "StatusText.fromStatusLine" {
+    try testing.expect((StatusText{}).get() == null);
+    try testing.expectEqualSlices(u8, "OK", StatusText.fromStatusLine("HTTP/1.1 200 OK\r\n").get().?);
+    try testing.expectEqualSlices(u8, "HOUSTON WE HAVE A", StatusText.fromStatusLine("HTTP/1.1 503 HOUSTON WE HAVE A\r\n").get().?);
+    try testing.expectEqualSlices(u8, "lowercase", StatusText.fromStatusLine("HTTP/1.0 502 lowercase\r\n").get().?);
+    // curl's synthesized HTTP/2 status line has no phrase
+    try testing.expectEqualSlices(u8, "", StatusText.fromStatusLine("HTTP/2 200 \r\n").get().?);
+    try testing.expectEqualSlices(u8, "", StatusText.fromStatusLine("HTTP/1.1 200\r\n").get().?);
+    try testing.expectEqual(StatusText.MAX_LEN, StatusText.fromStatusLine("HTTP/1.1 200 " ++ repeat("x", 200)).get().?.len);
+    try testing.expectEqualSlices(u8, "OK", StatusText.fromStatusLine("HTTP/1.1\t200\tOK\r\n").get().?);
+
+    // the cap backs off to a UTF-8 boundary: 127 x's + "é" would split at 128
+    try testing.expectEqualSlices(u8, repeat("x", 127), StatusText.fromStatusLine("HTTP/1.1 200 " ++ repeat("x", 127) ++ "é").get().?);
+    try testing.expectEqualSlices(u8, repeat("x", 126) ++ "é", StatusText.fromStatusLine("HTTP/1.1 200 " ++ repeat("x", 126) ++ "éé").get().?);
+    // 4-byte sequence straddling the cap
+    try testing.expectEqualSlices(u8, repeat("x", 126), StatusText.fromStatusLine("HTTP/1.1 200 " ++ repeat("x", 126) ++ "😀").get().?);
+    // Latin-1 continuation-looking bytes: hard cut, no unbounded walk back
+    try testing.expectEqual(StatusText.MAX_LEN, StatusText.fromStatusLine("HTTP/1.1 200 " ++ repeat("\xa1", 200)).get().?.len);
+}
+
 test "opensocketCallback: private IPv4 returns CURL_SOCKET_BAD" {
     testing.silenceLog(&.{.http});
 
     const filter = IpFilter.init(true, null);
     var sa = makeSockAddrV4(.{ 127, 0, 0, 1 });
-    const result = opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), &sa);
+    const result = opensocketCallback(@ptrCast(@constCast(&filter)), @backingInt(libcurl.CurlSockType.ipcxn), &sa);
     try testing.expectEqual(libcurl.CURL_SOCKET_BAD, result);
 }
 
@@ -1035,7 +1186,7 @@ test "opensocketCallback: public IPv4 opens a real socket" {
     const filter = IpFilter.init(true, null);
     var sa = makeSockAddrV4(.{ 8, 8, 8, 8 });
 
-    const fd = opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), &sa);
+    const fd = opensocketCallback(@ptrCast(@constCast(&filter)), @backingInt(libcurl.CurlSockType.ipcxn), &sa);
     defer _ = std.c.close(fd);
 
     // A real fd is always >= 0
@@ -1044,7 +1195,7 @@ test "opensocketCallback: public IPv4 opens a real socket" {
 
 test "opensocketCallback: null clientp returns CURL_SOCKET_BAD (fail-closed)" {
     var sa = makeSockAddrV4(.{ 8, 8, 8, 8 });
-    const result = opensocketCallback(null, @intFromEnum(libcurl.CurlSockType.ipcxn), &sa);
+    const result = opensocketCallback(null, @backingInt(libcurl.CurlSockType.ipcxn), &sa);
     try testing.expectEqual(libcurl.CURL_SOCKET_BAD, result);
 }
 
@@ -1052,8 +1203,20 @@ test "opensocketCallback: block_private=false allows private IP" {
     // When block_private is false the filter blocks nothing
     const filter = IpFilter.init(false, null);
     var sa = makeSockAddrV4(.{ 127, 0, 0, 1 });
-    const fd = opensocketCallback(@ptrCast(@constCast(&filter)), @intFromEnum(libcurl.CurlSockType.ipcxn), &sa);
+    const fd = opensocketCallback(@ptrCast(@constCast(&filter)), @backingInt(libcurl.CurlSockType.ipcxn), &sa);
     defer _ = std.c.close(fd);
 
     try testing.expect(fd >= 0);
+}
+
+test "Connection.inHttpRange: only a real status survives" {
+    const kept = [_]c_long{ 100, 200, 404, 503, 599 };
+    for (kept) |status| {
+        try std.testing.expectEqual(@as(u16, @intCast(status)), Connection.inHttpRange(status));
+    }
+    // 9999 used to survive and then panic in every std.http.Status cast.
+    const dropped = [_]c_long{ -1, 0, 99, 600, 1024, 9999, 65536 };
+    for (dropped) |status| {
+        try std.testing.expectEqual(0, Connection.inHttpRange(status));
+    }
 }

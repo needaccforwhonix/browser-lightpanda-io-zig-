@@ -46,7 +46,7 @@ const Unit = enum(u16) {
 };
 
 pub fn detached(frame: *Frame) !*Angle {
-    const arena = try frame._page.getArena(.tiny, "SVGAngle");
+    const arena = try frame.page.getArena(.tiny, "SVGAngle");
     errdefer arena.release();
     const self = try arena.create(Angle);
     self.* = .{ ._arena = arena };
@@ -69,7 +69,7 @@ fn getUnitType(self: *Angle) u16 {
     self.syncFromAttribute();
     return switch (self._unit) {
         .turn => 0,
-        else => @intFromEnum(self._unit),
+        else => @backingInt(self._unit),
     };
 }
 
@@ -173,7 +173,7 @@ fn writeBack(self: *Angle, frame: *Frame) !void {
 }
 
 fn serialize(self: *const Angle, frame: *Frame) ![]const u8 {
-    return std.fmt.allocPrint(frame.local_arena, "{d}{s}", .{ self._value, unitSuffix(self._unit) });
+    return frame.local_arena.print("{d}{s}", .{ self._value, unitSuffix(self._unit) });
 }
 
 const Parsed = struct {
@@ -232,12 +232,21 @@ fn unitSuffix(unit: Unit) []const u8 {
     };
 }
 
+// value and valueInSpecifiedUnits are WebIDL `float`. Storage stays f64 so
+// valueAsString serializes what was parsed, not its f32 rounding.
+fn jsGetValue(self: *Angle) f32 {
+    return @floatCast(self.getValue());
+}
+
+fn jsGetValueInSpecifiedUnits(self: *Angle) f32 {
+    return @floatCast(self.getValueInSpecifiedUnits());
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Angle);
 
     pub const Meta = struct {
         pub const name = "SVGAngle";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -248,8 +257,8 @@ pub const JsApi = struct {
     pub const SVG_ANGLETYPE_GRAD = bridge.property(4, .{ .template = true });
 
     pub const unitType = bridge.accessor(Angle.getUnitType, null, .{});
-    pub const value = bridge.accessor(Angle.getValue, Angle.setValue, .{});
-    pub const valueInSpecifiedUnits = bridge.accessor(Angle.getValueInSpecifiedUnits, Angle.setValueInSpecifiedUnits, .{});
+    pub const value = bridge.accessor(Angle.jsGetValue, Angle.setValue, .{});
+    pub const valueInSpecifiedUnits = bridge.accessor(Angle.jsGetValueInSpecifiedUnits, Angle.setValueInSpecifiedUnits, .{});
     pub const valueAsString = bridge.accessor(Angle.getValueAsString, Angle.setValueAsString, .{});
     pub const newValueSpecifiedUnits = bridge.function(Angle.newValueSpecifiedUnits, .{});
     pub const convertToSpecifiedUnits = bridge.function(Angle.convertToSpecifiedUnits, .{});

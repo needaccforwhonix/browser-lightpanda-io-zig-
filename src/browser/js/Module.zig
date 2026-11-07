@@ -36,7 +36,7 @@ pub const Status = enum(u32) {
 };
 
 pub fn getStatus(self: Module) Status {
-    return @enumFromInt(v8.v8__Module__GetStatus(self.handle));
+    return @fromBackingInt(@intCast(v8.v8__Module__GetStatus(self.handle)));
 }
 
 pub fn getException(self: Module) js.Value {
@@ -87,6 +87,11 @@ pub fn evaluate(self: Module) !js.Value {
     const res = v8.v8__Module__Evaluate(self.handle, self.local.handle) orelse return error.JsException;
 
     if (self.getStatus() == .kErrored) {
+        // `res` is the evaluation promise, already rejected. It never reaches
+        // the page, so it isn't an unhandled rejection: the caller reports
+        // the exception itself.
+        const promise: js.Promise = .{ .local = self.local, .handle = @ptrCast(res) };
+        promise.markAsHandled();
         return error.JsException;
     }
 
@@ -106,6 +111,26 @@ pub fn getModuleNamespace(self: Module) js.Value {
         .handle = v8.v8__Module__GetModuleNamespace(self.handle).?,
     };
 }
+
+// Serialize the compiled module. Unlike Script.Unbound.createCodeCache, this
+// doesn't copy. The caller must deinit the result.
+pub fn createCodeCache(self: Module) !CodeCache {
+    const unbound = v8.v8__Module__GetUnboundModuleScript(self.handle).?;
+    const cached = v8.v8__ScriptCompiler__CreateModuleCodeCache(unbound) orelse return error.CodeCacheFailed;
+    return .{ .handle = cached };
+}
+
+pub const CodeCache = struct {
+    handle: *v8.ScriptCompilerCachedData,
+
+    pub fn deinit(self: CodeCache) void {
+        v8.v8__ScriptCompiler__CachedData__DELETE(self.handle);
+    }
+    pub fn bytes(self: CodeCache) []const u8 {
+        const len: usize = @intCast(self.handle.*.length);
+        return self.handle.*.data[0..len];
+    }
+};
 
 pub fn persist(self: Module) !Global {
     var ctx = self.local.ctx;

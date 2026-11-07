@@ -17,7 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Pure helpers behind the agent's `/save`: parsing the command, validating and
-//! picking filenames, writing script files, and shaping the synthesis prompt.
+//! picking filenames, and shaping the synthesis prompt.
 //! State-bearing orchestration (path resolution against the active session,
 //! LLM synthesis turns) lives on `Agent`.
 
@@ -43,11 +43,11 @@ pub fn parseCommand(arena: std.mem.Allocator, rest: []const u8) !Command {
     var after: []const u8 = undefined;
     if (trimmed[0] == '\'' or trimmed[0] == '"') {
         const quote = trimmed[0];
-        const end = std.mem.indexOfScalarPos(u8, trimmed, 1, quote) orelse return error.UnterminatedQuote;
+        const end = std.mem.findScalarPos(u8, trimmed, 1, quote) orelse return error.UnterminatedQuote;
         name = trimmed[1..end];
         after = trimmed[end + 1 ..];
     } else {
-        const tok_end = std.mem.indexOfAny(u8, trimmed, &std.ascii.whitespace) orelse trimmed.len;
+        const tok_end = std.mem.findAny(u8, trimmed, &std.ascii.whitespace) orelse trimmed.len;
         name = trimmed[0..tok_end];
         after = trimmed[tok_end..];
     }
@@ -72,7 +72,7 @@ pub fn randomFilename(arena: std.mem.Allocator) ![]const u8 {
         var n_bytes: [8]u8 = undefined;
         lp.io.random(&n_bytes);
         const n = std.mem.readInt(u64, &n_bytes, .little);
-        const path = try std.fmt.allocPrint(arena, "session-{x}.js", .{n});
+        const path = try arena.print("session-{x}.js", .{n});
         if (!(try fileExists(path))) return path;
     }
     return error.NameCollision;
@@ -81,7 +81,7 @@ pub fn randomFilename(arena: std.mem.Allocator) ![]const u8 {
 /// Read a previously saved script back for revision. Returns null when there
 /// is nothing to feed the model: the file does not exist or is blank.
 pub fn readScript(arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    const content = std.Io.Dir.cwd().readFileAlloc(lp.io, path, arena, .limited(1024 * 1024)) catch |err| switch (err) {
+    const content = lp.script_file.read(arena, path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -97,30 +97,14 @@ pub fn fileExists(path: []const u8) !bool {
     return true;
 }
 
-pub fn writeContentFile(path: []const u8, content: []const u8, mode: Mode) !void {
-    const file = try std.Io.Dir.cwd().createFile(lp.io, path, .{ .truncate = mode != .append });
-    defer file.close(lp.io);
-    var offset: u64 = 0;
-    if (mode == .append) {
-        offset = try file.length(lp.io);
-        if (offset > 0 and content.len > 0) {
-            try file.writePositionalAll(lp.io, "\n", offset);
-            offset += 1;
-        }
-    }
-    try file.writePositionalAll(lp.io, content, offset);
-    offset += content.len;
-    if (content.len > 0 and content[content.len - 1] != '\n') try file.writePositionalAll(lp.io, "\n", offset);
-}
-
 /// Strip a surrounding ```` ```lang … ``` ```` markdown fence if the model
 /// wrapped its output in one despite being told not to.
 pub fn stripCodeFence(text: []const u8) []const u8 {
     const t = std.mem.trim(u8, text, &std.ascii.whitespace);
     if (!std.mem.startsWith(u8, t, "```")) return t;
-    const first_nl = std.mem.indexOfScalar(u8, t, '\n') orelse return t;
+    const first_nl = std.mem.findScalar(u8, t, '\n') orelse return t;
     const body = t[first_nl + 1 ..];
-    const close = std.mem.lastIndexOf(u8, body, "```") orelse return std.mem.trim(u8, body, &std.ascii.whitespace);
+    const close = std.mem.findLast(u8, body, "```") orelse return std.mem.trim(u8, body, &std.ascii.whitespace);
     return std.mem.trim(u8, body[0..close], &std.ascii.whitespace);
 }
 
